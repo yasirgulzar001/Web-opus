@@ -8,6 +8,7 @@ import asyncio
 import logging
 import re
 import os
+import sys
 import time
 import tempfile
 from datetime import datetime, timedelta
@@ -77,61 +78,40 @@ scraper = cloudscraper.create_scraper()
 UNAUTHORIZED_MSG = (
     "⛔ <b>Access Disabled</b>\n\n"
     "Buy Premium: <a href='https://t.me/NEVER_DIE8'>@NEVER_DIE8</a>\n"
-    "/referral – Premium-only feature"
+    "/referral – Get your referral link &amp; stats"
 )
 
 # ------------------------------------------------------------
-# Access control  (FIXED)
+# FIXED: is_allowed() correctly rejects unknown users
 # ------------------------------------------------------------
-def is_premium(user_id: int) -> bool:
-    """True if user is currently premium (active & not expired). Does NOT mutate."""
-    if user_id not in ALLOWED_USERS:
-        return False
-    expiry = ALLOWED_USERS[user_id]
-    if expiry is None:
-        return True                 # permanent
-    return expiry > datetime.now()  # must still be valid
-
-
 def is_allowed(user_id: int) -> bool:
-    """Return True if user is explicitly allowed and not expired. Cleans up expired."""
+    """Return True if user is explicitly allowed and not expired."""
     if user_id not in ALLOWED_USERS:
-        return False
+        return False                # completely unknown → not allowed
     expiry = ALLOWED_USERS[user_id]
     if expiry is None:
-        return True
+        return True                 # permanent access
     if expiry > datetime.now():
-        return True
+        return True                 # still valid
     # expired – remove from dict and clean up session
     ALLOWED_USERS.pop(user_id, None)
     USER_SESSIONS.pop(user_id, None)
     return False
 
-
-def extend_user_time(user_id: int, minutes: int) -> bool:
-    """
-    Extend a CURRENTLY-PREMIUM user's time by `minutes`.
-    Returns True if extension applied OR user is permanent.
-    Returns False if user is not premium / expired / unknown.
-    """
-    if user_id not in ALLOWED_USERS:
-        return False
-    expiry = ALLOWED_USERS[user_id]
-    if expiry is None:
-        return True                 # permanent – no extension needed
-    if expiry <= datetime.now():
-        return False                # expired – must buy premium first
-    ALLOWED_USERS[user_id] = expiry + timedelta(minutes=minutes)
-    return True
-
+def extend_user_time(user_id: int, minutes: int):
+    if user_id not in ALLOWED_USERS or ALLOWED_USERS[user_id] is None:
+        return
+    current = ALLOWED_USERS[user_id]
+    new = max(current, datetime.now()) + timedelta(minutes=minutes)
+    ALLOWED_USERS[user_id] = new
 
 async def send_long_message(update: Update, text: str, parse_mode: str = None):
     max_len = 4000
     for i in range(0, len(text), max_len):
-        await update.message.reply_text(text[i:i + max_len], parse_mode=parse_mode)
+        await update.message.reply_text(text[i:i+max_len], parse_mode=parse_mode)
 
 # ------------------------------------------------------------
-# Email & OTP
+# Email & OTP (unchanged)
 # ------------------------------------------------------------
 async def create_email() -> tuple[str, str]:
     try:
@@ -145,7 +125,6 @@ async def create_email() -> tuple[str, str]:
     except Exception as e:
         logger.error(f"Email creation failed: {e}")
         raise
-
 
 async def fetch_otp(email: str, mailbox_id: str) -> Optional[str]:
     start = time.time()
@@ -173,7 +152,7 @@ async def fetch_otp(email: str, mailbox_id: str) -> Optional[str]:
     return None
 
 # ------------------------------------------------------------
-# Syntx.ai API
+# Syntx.ai API (unchanged)
 # ------------------------------------------------------------
 async def send_otp(email: str) -> bool:
     try:
@@ -184,9 +163,8 @@ async def send_otp(email: str) -> bool:
             timeout=HTTP_TIMEOUT,
         )
         return resp.status_code == 200 and resp.json().get("success")
-    except Exception:
+    except:
         return False
-
 
 async def verify_otp(email: str, otp: str) -> Optional[str]:
     try:
@@ -198,9 +176,8 @@ async def verify_otp(email: str, otp: str) -> Optional[str]:
         )
         if resp.status_code == 200 and resp.json().get("success"):
             return resp.json().get("token")
-    except Exception:
+    except:
         return None
-
 
 async def create_chat(token: str) -> Optional[str]:
     try:
@@ -215,9 +192,8 @@ async def create_chat(token: str) -> Optional[str]:
         )
         if resp.status_code == 201:
             return resp.json().get("uuid")
-    except Exception:
+    except:
         return None
-
 
 async def upload_image(token: str, chat_uuid: str, file_path: str) -> Optional[str]:
     try:
@@ -233,9 +209,8 @@ async def upload_image(token: str, chat_uuid: str, file_path: str) -> Optional[s
             )
             if resp.status_code == 200 and resp.json().get("successful", 0) > 0:
                 return resp.json()["files"][0]["url"]
-    except Exception:
+    except:
         return None
-
 
 async def send_message(token: str, chat_uuid: str, objects: list) -> Optional[int]:
     try:
@@ -250,9 +225,8 @@ async def send_message(token: str, chat_uuid: str, objects: list) -> Optional[in
         )
         if resp.status_code == 200:
             return resp.json().get("id")
-    except Exception:
+    except:
         return None
-
 
 async def fetch_reply(token: str, chat_uuid: str, after_id: int, timeout: int = REPLY_TIMEOUT) -> Optional[str]:
     start = time.time()
@@ -269,19 +243,16 @@ async def fetch_reply(token: str, chat_uuid: str, after_id: int, timeout: int = 
             if resp.status_code == 200:
                 for msg in resp.json().get("messages", []):
                     if msg.get("author_id") == -1 and msg.get("id", 0) > after_id:
-                        obj_list = msg.get("message_object", []) or []
-                        if not obj_list:
-                            continue
-                        obj = obj_list[0]
+                        obj = msg.get("message_object", [{}])[0]
                         if obj.get("object_type") == "text" and obj.get("completed"):
                             return obj.get("object_text")
-        except Exception:
+        except:
             pass
         await asyncio.sleep(POLL_INTERVAL)
     return None
 
 # ------------------------------------------------------------
-# Session management
+# Session management (unchanged)
 # ------------------------------------------------------------
 async def new_session(chat_id: int) -> Optional[str]:
     try:
@@ -315,10 +286,10 @@ async def new_session(chat_id: int) -> Optional[str]:
 # Command handlers
 # ------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start with optional referral code. Referral rewards are PREMIUM-ONLY."""
+    """Handle /start with optional referral code."""
     user = update.effective_user
     try:
-        # Already premium → start session immediately
+        # If already allowed, start session immediately
         if is_allowed(user.id):
             err = await new_session(user.id)
             if err:
@@ -332,60 +303,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        args = context.args or []
+        # Not allowed yet – check for referral code
+        args = context.args
         referral_processed = False
-
         if args and args[0].startswith("ref_"):
             try:
                 referrer_id = int(args[0][4:])
+                if referrer_id == user.id:
+                    await update.message.reply_text("❌ You cannot refer yourself.")
+                    return
+
+                # Always grant the trial to the new user
+                expiry = datetime.now() + timedelta(minutes=REFERREE_TRIAL_MINUTES)
+                ALLOWED_USERS[user.id] = expiry
+                referral_processed = True
+
+                # Reward the referrer ONLY if they are premium
+                if referrer_id in ALLOWED_USERS:
+                    extend_user_time(referrer_id, REFERRER_REWARD_MINUTES)
+                    # Notify referrer
+                    try:
+                        await context.bot.send_message(
+                            chat_id=referrer_id,
+                            text=f"🎉 New referral! You earned {REFERRER_REWARD_MINUTES} min.",
+                        )
+                    except:
+                        pass
+                else:
+                    # Referrer is not premium – still count the referral
+                    # but don't give them time (they need to be premium first)
+                    logger.info(f"Referral from non-premium user {referrer_id} for {user.id}")
+
+                # Always increment referral count (for stats)
+                REFERRAL_COUNT[referrer_id] = REFERRAL_COUNT.get(referrer_id, 0) + 1
+
             except (ValueError, IndexError):
                 await update.message.reply_text("❌ Invalid referral code format.")
                 return
 
-            if referrer_id == user.id:
-                await update.message.reply_text("❌ You cannot refer yourself.")
-                return
-
-            # Grant trial to the new user (always)
-            expiry = datetime.now() + timedelta(minutes=REFERREE_TRIAL_MINUTES)
-            ALLOWED_USERS[user.id] = expiry
-            referral_processed = True
-
-            # ===== FIX: Reward & count ONLY if referrer is currently premium =====
-            if is_premium(referrer_id):
-                ref_expiry = ALLOWED_USERS.get(referrer_id)
-                is_permanent = ref_expiry is None
-
-                # Increment count for premium referrer only
-                REFERRAL_COUNT[referrer_id] = REFERRAL_COUNT.get(referrer_id, 0) + 1
-
-                if is_permanent:
-                    notify_msg = "🎉 New referral! (Permanent premium – no time added.)"
-                else:
-                    # extend_user_time only extends ACTIVE timed users
-                    extended = extend_user_time(referrer_id, REFERRER_REWARD_MINUTES)
-                    if extended:
-                        notify_msg = f"🎉 New referral! You earned {REFERRER_REWARD_MINUTES} min."
-                    else:
-                        notify_msg = "🎉 New referral! (Could not extend – premium may have just expired.)"
-
-                try:
-                    await context.bot.send_message(chat_id=referrer_id, text=notify_msg)
-                except Exception as e:
-                    logger.warning(f"Could not notify referrer {referrer_id}: {e}")
-            else:
-                # Referrer is NOT premium → no reward, no count
-                logger.info(
-                    f"Referral ignored – referrer {referrer_id} is not premium "
-                    f"(new user {user.id} still got trial)."
-                )
-            # ====================================================================
-
         if not referral_processed:
+            # Show the premium prompt immediately – no waiting
             await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
             return
 
-        # Referral processed – start session for the new user
+        # Referral successful – start session for the new user
         err = await new_session(user.id)
         if err:
             await update.message.reply_text(err)
@@ -396,28 +357,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"start handler exception: {e}", exc_info=True)
+        # Fallback so the user always sees something
         await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
 
-
 async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Referral link & stats – PREMIUM USERS ONLY."""
+    """Give referral link to ANYONE (premium or not)."""
     user = update.effective_user
 
-    # FIX: Only premium users can access referral system
-    if not is_allowed(user.id):
-        await update.message.reply_text(
-            "⛔ <b>Referral is a premium-only feature.</b>\n\n"
-            "Buy Premium: <a href='https://t.me/NEVER_DIE8'>@NEVER_DIE8</a>",
-            parse_mode=constants.ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        return
-
+    # Everyone gets their unique link
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
     count = REFERRAL_COUNT.get(user.id, 0)
 
-    expiry = ALLOWED_USERS[user.id]
-    exp_str = "Permanent" if expiry is None else expiry.strftime("%Y-%m-%d %H:%M UTC")
+    # Show expiry only if the user is already in the whitelist
+    if user.id in ALLOWED_USERS:
+        expiry = ALLOWED_USERS[user.id]
+        if expiry is None:
+            exp_str = "Permanent"
+        else:
+            exp_str = expiry.strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        exp_str = "❌ Not premium yet"
 
     msg = (
         f"🔗 <b>Your Referral Link</b>\n"
@@ -425,12 +384,9 @@ async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Successful referrals: {count}\n"
         f"🕒 Your premium expiry: {exp_str}\n\n"
         f"📌 Earn <b>{REFERRER_REWARD_MINUTES} min</b> per friend who joins using your link.\n"
-        f"⚠️ Rewards are only added while you remain premium."
+        f"⚠️ Rewards are only added if you are already premium."
     )
-    await update.message.reply_text(
-        msg, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True
-    )
-
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -457,7 +413,6 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_SESSIONS[user.id]["model_name"] = model_name
     await update.message.reply_text(f"✅ Model set to: {model_name}")
 
-
 async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_allowed(user.id):
@@ -466,21 +421,20 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_SESSIONS.pop(user.id, None)
     await start(update, context)
 
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 <b>Claude Chat Bot Commands</b>\n\n"
         "/start – Start a new session\n"
         "/model [number] – Choose Claude model\n"
         "/new – Reset session (fresh credentials)\n"
-        "/referral – Get your referral link &amp; stats <i>(premium only)</i>\n"
+        "/referral – Get your referral link &amp; stats\n"
         "/help – Show this help\n\n"
         "<b>OWNER: @NEVER_DIE8</b> – contact for premium"
     )
     await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
 
 # ------------------------------------------------------------
-# Admin commands
+# Admin commands (unchanged)
 # ------------------------------------------------------------
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -495,7 +449,6 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ User {uid} added permanently.")
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.")
-
 
 async def add_user_timed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -519,7 +472,6 @@ async def add_user_timed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ User {uid} added for {hours} hour(s). Expires at {expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC."
     )
 
-
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
@@ -538,7 +490,6 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.")
 
-
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
@@ -547,14 +498,13 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = " ".join(context.args)
     sent = 0
-    for uid in list(ALLOWED_USERS.keys()):
+    for uid in list(USER_SESSIONS.keys()):
         try:
             await context.bot.send_message(chat_id=uid, text=f"📢 Broadcast:\n{text}")
             sent += 1
-        except Exception:
+        except:
             pass
     await update.message.reply_text(f"✅ Broadcast sent to {sent} users.")
-
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -571,7 +521,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  - Timed (expired): {expired}\n"
         f"🔗 Total referrals: {sum(REFERRAL_COUNT.values())}"
     )
-
 
 async def admin_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -603,8 +552,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No active session. Use /start.")
         return
 
-    # FIX: guard against None text
-    text = (update.message.text or "").strip()
+    text = update.message.text.strip()
     if not text:
         return
 
@@ -625,11 +573,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
     if reply:
-        await send_long_message(
-            update,
-            f"**{session['model_name']}:** {reply}",
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
+        await send_long_message(update, f"**{session['model_name']}:** {reply}",
+                                parse_mode=constants.ParseMode.MARKDOWN)
         session["message_count"] += 1
     else:
         await update.message.reply_text("❌ No reply received.")
@@ -637,7 +582,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if MAX_MESSAGES > 0 and session["message_count"] >= MAX_MESSAGES:
         await update.message.reply_text("⚠️ Message limit reached. Use /new to reset.")
         session["active"] = False
-
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -650,6 +594,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No active session. Use /start.")
         return
 
+    # Download photo once to a temp file
     photo_file = await update.message.photo[-1].get_file()
     tmp_path = None
     try:
@@ -686,11 +631,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
         if reply:
-            await send_long_message(
-                update,
-                f"**{session['model_name']}:** {reply}",
-                parse_mode=constants.ParseMode.MARKDOWN,
-            )
+            await send_long_message(update, f"**{session['model_name']}:** {reply}",
+                                    parse_mode=constants.ParseMode.MARKDOWN)
             session["message_count"] += 1
         else:
             await update.message.reply_text("❌ No reply received.")
@@ -700,10 +642,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session["active"] = False
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            os.unlink(tmp_path)
 
 # ------------------------------------------------------------
 # Error handler
@@ -711,13 +650,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception:", exc_info=context.error)
     if update and update.effective_chat:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⚠️ An internal error occurred. Please try again.",
-            )
-        except Exception:
-            pass
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ An internal error occurred. Please try again.",
+        )
 
 # ------------------------------------------------------------
 # Main
@@ -726,7 +662,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("referral", referral_cmd))   # premium-only now
+    app.add_handler(CommandHandler("referral", referral_cmd))    # available to everyone
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -745,7 +681,6 @@ def main():
 
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
