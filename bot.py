@@ -2,6 +2,7 @@
 """
 Telegram Bot for Syntx.ai Claude Chat with Admin Control + Referral System
 Owner: @NEVER_DIE8
+1 referral = 30 min premium for referrer, 30 min trial for new user
 """
 
 import asyncio
@@ -26,14 +27,14 @@ from telegram.ext import (
 )
 
 # ------------------------------------------------------------
-# Configuration
+# Configuration (fill in your BOT_USERNAME)
 # ------------------------------------------------------------
-BOT_TOKEN = "8284048798:AAHd4XbDoJ2VXhN2hL3b9s_8GVEyD7yREdg"          # Replace with your bot token
-ADMIN_IDS = {6535041385}                    # Your Telegram user ID(s)
-BOT_USERNAME = "ProxysGOBOT"      # Without @
+BOT_TOKEN = "8284048798:AAHd4XbDoJ2VXhN2hL3b9s_8GVEyD7yREdg"
+ADMIN_IDS = {6535041385}                     # Admin Telegram user ID(s)
+BOT_USERNAME = "ProxysGOBOT"       # ⚠️ Replace with your actual bot username (without @)
 
-REFERRER_REWARD_MINUTES = 30
-REFERREE_TRIAL_MINUTES = 60
+REFERRER_REWARD_MINUTES = 30      # what the referrer earns per referral
+REFERREE_TRIAL_MINUTES = 30       # what the new user gets as trial
 
 EMAIL_API = "https://zecora0.serv00.net/Gmail.php"
 SYNTX_AUTH_SEND_OTP = "https://api.syntx.ai/api/v1/auth/email/send-otp"
@@ -82,28 +83,36 @@ UNAUTHORIZED_MSG = (
 )
 
 # ------------------------------------------------------------
-# FIXED: is_allowed() correctly rejects unknown users
+# Helper: add or extend premium for a user
 # ------------------------------------------------------------
+def add_or_extend_premium(user_id: int, minutes: int):
+    """Give a user `minutes` of premium, adding them if new or extending."""
+    now = datetime.now()
+    if user_id not in ALLOWED_USERS:
+        # New premium user
+        ALLOWED_USERS[user_id] = now + timedelta(minutes=minutes)
+    else:
+        current = ALLOWED_USERS[user_id]
+        if current is None:
+            # Permanent – no need to extend
+            return
+        # Extend from max(now, current)
+        new_expiry = max(now, current) + timedelta(minutes=minutes)
+        ALLOWED_USERS[user_id] = new_expiry
+
 def is_allowed(user_id: int) -> bool:
     """Return True if user is explicitly allowed and not expired."""
     if user_id not in ALLOWED_USERS:
-        return False                # completely unknown → not allowed
+        return False
     expiry = ALLOWED_USERS[user_id]
     if expiry is None:
-        return True                 # permanent access
+        return True
     if expiry > datetime.now():
-        return True                 # still valid
-    # expired – remove from dict and clean up session
+        return True
+    # expired
     ALLOWED_USERS.pop(user_id, None)
     USER_SESSIONS.pop(user_id, None)
     return False
-
-def extend_user_time(user_id: int, minutes: int):
-    if user_id not in ALLOWED_USERS or ALLOWED_USERS[user_id] is None:
-        return
-    current = ALLOWED_USERS[user_id]
-    new = max(current, datetime.now()) + timedelta(minutes=minutes)
-    ALLOWED_USERS[user_id] = new
 
 async def send_long_message(update: Update, text: str, parse_mode: str = None):
     max_len = 4000
@@ -252,7 +261,7 @@ async def fetch_reply(token: str, chat_uuid: str, after_id: int, timeout: int = 
     return None
 
 # ------------------------------------------------------------
-# Session management (unchanged)
+# Session management
 # ------------------------------------------------------------
 async def new_session(chat_id: int) -> Optional[str]:
     try:
@@ -289,7 +298,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start with optional referral code."""
     user = update.effective_user
     try:
-        # If already allowed, start session immediately
         if is_allowed(user.id):
             err = await new_session(user.id)
             if err:
@@ -303,7 +311,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Not allowed yet – check for referral code
         args = context.args
         referral_processed = False
         if args and args[0].startswith("ref_"):
@@ -313,40 +320,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("❌ You cannot refer yourself.")
                     return
 
-                # Always grant the trial to the new user
-                expiry = datetime.now() + timedelta(minutes=REFERREE_TRIAL_MINUTES)
-                ALLOWED_USERS[user.id] = expiry
-                referral_processed = True
+                # 1. Grant trial to the new user
+                add_or_extend_premium(user.id, REFERREE_TRIAL_MINUTES)
 
-                # Reward the referrer ONLY if they are premium
-                if referrer_id in ALLOWED_USERS:
-                    extend_user_time(referrer_id, REFERRER_REWARD_MINUTES)
-                    # Notify referrer
-                    try:
-                        await context.bot.send_message(
-                            chat_id=referrer_id,
-                            text=f"🎉 New referral! You earned {REFERRER_REWARD_MINUTES} min.",
-                        )
-                    except:
-                        pass
-                else:
-                    # Referrer is not premium – still count the referral
-                    # but don't give them time (they need to be premium first)
-                    logger.info(f"Referral from non-premium user {referrer_id} for {user.id}")
+                # 2. Reward the referrer (even if they weren't premium)
+                add_or_extend_premium(referrer_id, REFERRER_REWARD_MINUTES)
 
-                # Always increment referral count (for stats)
+                # 3. Update referral counter
                 REFERRAL_COUNT[referrer_id] = REFERRAL_COUNT.get(referrer_id, 0) + 1
+
+                # 4. Notify referrer
+                try:
+                    await context.bot.send_message(
+                        chat_id=referrer_id,
+                        text=(
+                            f"🎉 New referral! You earned {REFERRER_REWARD_MINUTES} min premium.\n"
+                            f"Your premium now expires: {ALLOWED_USERS[referrer_id].strftime('%Y-%m-%d %H:%M UTC') if ALLOWED_USERS[referrer_id] else 'Permanent'}"
+                        ),
+                    )
+                except:
+                    pass
+
+                referral_processed = True
 
             except (ValueError, IndexError):
                 await update.message.reply_text("❌ Invalid referral code format.")
                 return
 
         if not referral_processed:
-            # Show the premium prompt immediately – no waiting
             await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
             return
 
-        # Referral successful – start session for the new user
+        # Start session for the new user
         err = await new_session(user.id)
         if err:
             await update.message.reply_text(err)
@@ -357,18 +362,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"start handler exception: {e}", exc_info=True)
-        # Fallback so the user always sees something
         await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
 
 async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Give referral link to ANYONE (premium or not)."""
+    """Give referral link to ANYONE."""
     user = update.effective_user
 
-    # Everyone gets their unique link
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
     count = REFERRAL_COUNT.get(user.id, 0)
 
-    # Show expiry only if the user is already in the whitelist
     if user.id in ALLOWED_USERS:
         expiry = ALLOWED_USERS[user.id]
         if expiry is None:
@@ -383,8 +385,10 @@ async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<code>{link}</code>\n\n"
         f"👥 Successful referrals: {count}\n"
         f"🕒 Your premium expiry: {exp_str}\n\n"
-        f"📌 Earn <b>{REFERRER_REWARD_MINUTES} min</b> per friend who joins using your link.\n"
-        f"⚠️ Rewards are only added if you are already premium."
+        f"📌 <b>1 referral = 30 min premium</b>\n"
+        f"➕ You get <b>{REFERRER_REWARD_MINUTES} min</b> added per friend.\n"
+        f"🎁 New users get <b>{REFERREE_TRIAL_MINUTES} min</b> trial.\n"
+        f"🔁 No limit – refer as many as you want!"
     )
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
@@ -434,7 +438,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
 
 # ------------------------------------------------------------
-# Admin commands (unchanged)
+# Admin commands
 # ------------------------------------------------------------
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -594,7 +598,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No active session. Use /start.")
         return
 
-    # Download photo once to a temp file
     photo_file = await update.message.photo[-1].get_file()
     tmp_path = None
     try:
@@ -662,7 +665,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("referral", referral_cmd))    # available to everyone
+    app.add_handler(CommandHandler("referral", referral_cmd))
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
