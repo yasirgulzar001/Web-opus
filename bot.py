@@ -82,7 +82,7 @@ UNAUTHORIZED_MSG = (
 )
 
 # ------------------------------------------------------------
-# FIXED: is_allowed() now correctly rejects unknown users
+# FIXED: is_allowed() correctly rejects unknown users
 # ------------------------------------------------------------
 def is_allowed(user_id: int) -> bool:
     """Return True if user is explicitly allowed and not expired."""
@@ -357,25 +357,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
 
 async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Give referral link to ANYONE (premium or not)."""
     user = update.effective_user
-    if not is_allowed(user.id):
-        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
-        return
 
+    # Everyone gets their unique link
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
     count = REFERRAL_COUNT.get(user.id, 0)
-    expiry = ALLOWED_USERS.get(user.id)
-    if expiry is None:
-        exp_str = "Permanent"
+
+    # Show expiry only if the user is already in the whitelist
+    if user.id in ALLOWED_USERS:
+        expiry = ALLOWED_USERS[user.id]
+        if expiry is None:
+            exp_str = "Permanent"
+        else:
+            exp_str = expiry.strftime("%Y-%m-%d %H:%M UTC")
     else:
-        exp_str = expiry.strftime("%Y-%m-%d %H:%M UTC")
+        exp_str = "❌ Not premium yet"
 
     msg = (
         f"🔗 <b>Your Referral Link</b>\n"
         f"<code>{link}</code>\n\n"
         f"👥 Successful referrals: {count}\n"
         f"🕒 Your premium expiry: {exp_str}\n\n"
-        f"📌 Earn <b>{REFERRER_REWARD_MINUTES} min</b> per friend."
+        f"📌 Earn <b>{REFERRER_REWARD_MINUTES} min</b> per friend who joins using your link."
     )
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
@@ -653,7 +657,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("referral", referral_cmd))
+    app.add_handler(CommandHandler("referral", referral_cmd))    # available to everyone
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
