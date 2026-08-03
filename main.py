@@ -29,9 +29,9 @@ from telegram.ext import (
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-BOT_TOKEN = "8799719369:AAGvETel8yd47W87nRB6hqNPyUWMc"  # Hardcoded as requested
+BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"  # Hardcoded as requested
 ADMIN_IDS = {6535041385}                     # Admin Telegram user ID(s)
-BOT_USERNAME = "PROBIxAichatbot"       # ⚠️ Replace with your actual bot username (without @)
+BOT_USERNAME = "PROBIxAichatbot"              # ⚠️ Replace with your actual bot username (without @)
 
 REFERRER_REWARD_MINUTES = 30      # what the referrer earns per referral
 REFERREE_TRIAL_MINUTES = 30       # what the new user gets as trial
@@ -44,7 +44,7 @@ SYNTX_UPLOAD = "https://api.syntx.ai/api/v1/chats/upload-files"
 
 HTTP_TIMEOUT = 15
 OTP_TIMEOUT = 120
-REPLY_TIMEOUT = 120
+REPLY_TIMEOUT = 600  # Increased to 10 minutes (600 seconds) for long responses
 POLL_INTERVAL = 2
 MAX_MESSAGES = 0
 
@@ -203,6 +203,23 @@ async def send_response_with_code_files(update: Update, text: str, model_name: s
                     os.unlink(tmp_path)
                 except Exception:
                     pass
+
+async def animate_thinking(bot, chat_id: int, message_id: int):
+    """Continuously edits a message to show a waving thinking animation."""
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    i = 0
+    while True:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"🧠 {frames[i % len(frames)]} Thinking..."
+            )
+        except Exception:
+            # Ignore "message not modified" errors to prevent crashes
+            pass
+        i += 1
+        await asyncio.sleep(1.5)
 
 # ------------------------------------------------------------
 # Email & OTP
@@ -698,12 +715,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to send message.")
         return
 
-    reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
+    # Start thinking animation
+    status_msg = await update.message.reply_text("🧠 Thinking...")
+    anim_task = asyncio.create_task(animate_thinking(context.bot, user.id, status_msg.message_id))
+
+    try:
+        reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
+    finally:
+        anim_task.cancel()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
     if reply:
         await send_response_with_code_files(update, reply, session["model_name"])
         session["message_count"] += 1
     else:
-        await update.message.reply_text("❌ No reply received.")
+        await update.message.reply_text("❌ No reply received. (Timed out after 10 minutes)")
 
     if MAX_MESSAGES > 0 and session["message_count"] >= MAX_MESSAGES:
         await update.message.reply_text("⚠️ Message limit reached. Use /new to reset.")
@@ -754,12 +783,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Failed to send message.")
             return
 
-        reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
+        # Start thinking animation
+        status_msg = await update.message.reply_text("🧠 Thinking...")
+        anim_task = asyncio.create_task(animate_thinking(context.bot, user.id, status_msg.message_id))
+
+        try:
+            reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
+        finally:
+            anim_task.cancel()
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
         if reply:
             await send_response_with_code_files(update, reply, session["model_name"])
             session["message_count"] += 1
         else:
-            await update.message.reply_text("❌ No reply received.")
+            await update.message.reply_text("❌ No reply received. (Timed out after 10 minutes)")
 
         if MAX_MESSAGES > 0 and session["message_count"] >= MAX_MESSAGES:
             await update.message.reply_text("⚠️ Message limit reached. Use /new to reset.")
@@ -837,12 +878,24 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Failed to send message.")
             return
 
-        reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
+        # Start thinking animation
+        status_msg = await update.message.reply_text("🧠 Thinking...")
+        anim_task = asyncio.create_task(animate_thinking(context.bot, user.id, status_msg.message_id))
+
+        try:
+            reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
+        finally:
+            anim_task.cancel()
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
         if reply:
             await send_response_with_code_files(update, reply, session["model_name"])
             session["message_count"] += 1
         else:
-            await update.message.reply_text("❌ No reply received.")
+            await update.message.reply_text("❌ No reply received. (Timed out after 10 minutes)")
 
         if MAX_MESSAGES > 0 and session["message_count"] >= MAX_MESSAGES:
             await update.message.reply_text("⚠️ Message limit reached. Use /new to reset.")
@@ -875,7 +928,9 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ------------------------------------------------------------
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    # concurrent_updates=True allows the bot to handle multiple users in parallel
+    # without getting stuck if one user's request takes a long time.
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("referral", referral_cmd))
