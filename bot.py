@@ -29,7 +29,7 @@ from telegram.ext import (
 # ------------------------------------------------------------
 # Configuration (fill in your BOT_USERNAME)
 # ------------------------------------------------------------
-BOT_TOKEN = "8284048798:AAHd4XbDoJ2VXhN2hL3b9s_8GVEyD7yREdg"
+BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"
 ADMIN_IDS = {6535041385}                     # Admin Telegram user ID(s)
 BOT_USERNAME = "ProxysGOBOT"       # ⚠️ Replace with your actual bot username (without @)
 
