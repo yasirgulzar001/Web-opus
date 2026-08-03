@@ -312,14 +312,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if referrer_id == user.id:
                     await update.message.reply_text("❌ You cannot refer yourself.")
                     return
-                if referrer_id in ALLOWED_USERS:
-                    # Add new user with trial
-                    expiry = datetime.now() + timedelta(minutes=REFERREE_TRIAL_MINUTES)
-                    ALLOWED_USERS[user.id] = expiry
-                    # Reward referrer
-                    extend_user_time(referrer_id, REFERRER_REWARD_MINUTES)
-                    REFERRAL_COUNT[referrer_id] = REFERRAL_COUNT.get(referrer_id, 0) + 1
 
+                # Always grant the trial to the new user
+                expiry = datetime.now() + timedelta(minutes=REFERREE_TRIAL_MINUTES)
+                ALLOWED_USERS[user.id] = expiry
+                referral_processed = True
+
+                # Reward the referrer ONLY if they are premium
+                if referrer_id in ALLOWED_USERS:
+                    extend_user_time(referrer_id, REFERRER_REWARD_MINUTES)
                     # Notify referrer
                     try:
                         await context.bot.send_message(
@@ -328,13 +329,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                     except:
                         pass
-
-                    referral_processed = True
                 else:
-                    await update.message.reply_text("❌ Invalid referral link.")
-                    return
+                    # Referrer is not premium – still count the referral
+                    # but don't give them time (they need to be premium first)
+                    logger.info(f"Referral from non-premium user {referrer_id} for {user.id}")
+
+                # Always increment referral count (for stats)
+                REFERRAL_COUNT[referrer_id] = REFERRAL_COUNT.get(referrer_id, 0) + 1
+
             except (ValueError, IndexError):
-                await update.message.reply_text("❌ Invalid referral code.")
+                await update.message.reply_text("❌ Invalid referral code format.")
                 return
 
         if not referral_processed:
@@ -379,7 +383,8 @@ async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<code>{link}</code>\n\n"
         f"👥 Successful referrals: {count}\n"
         f"🕒 Your premium expiry: {exp_str}\n\n"
-        f"📌 Earn <b>{REFERRER_REWARD_MINUTES} min</b> per friend who joins using your link."
+        f"📌 Earn <b>{REFERRER_REWARD_MINUTES} min</b> per friend who joins using your link.\n"
+        f"⚠️ Rewards are only added if you are already premium."
     )
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
