@@ -30,7 +30,7 @@ import uvicorn
 # CONFIGURATION – EDIT THESE TWO VALUES
 # ============================================================
 BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"          # Replace with your bot token from @BotFather
-ADMIN_IDS = {7590180047}                   # Replace with your Telegram numeric user ID
+ADMIN_IDS = {6535041385}                   # Replace with your Telegram numeric user ID
 
 # After you start ngrok, you must update the Mini App URL in the /start command below.
 # ============================================================
@@ -319,7 +319,7 @@ async def fetch_reply_api(token: str, chat_uuid: str, after_id: int) -> Optional
     return None
 
 # ------------------------------------------------------------
-# ACCESS CONTROL (unchanged except used by new referral logic)
+# ACCESS CONTROL
 # ------------------------------------------------------------
 async def check_access(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
@@ -335,22 +335,49 @@ async def check_access(user_id: int) -> bool:
     return True
 
 # ------------------------------------------------------------
-# NEW: helper to add referral bonus to a referrer
+# NEW SESSION CREATION (required by /start)
+# ------------------------------------------------------------
+async def new_session(uid: int) -> Optional[str]:
+    try:
+        email, mid = await create_email()
+        if not await send_otp_api(email):
+            return "❌ Failed to send OTP."
+        otp = await fetch_otp(email, mid)
+        if not otp:
+            return "❌ OTP not received."
+        token = await verify_otp_api(email, otp)
+        if not token:
+            return "❌ OTP verification failed."
+        chat_uuid = await create_chat_api(token)
+        if not chat_uuid:
+            return "❌ Chat creation failed."
+        USER_SESSIONS[uid] = {
+            'email': email,
+            'token': token,
+            'chat_uuid': chat_uuid,
+            'model_id': 'claude-sonnet-5',
+            'model_name': 'Claude Sonnet 5',
+            'last_message_id': 0,
+            'message_count': 0
+        }
+        return None
+    except Exception as e:
+        logger.error(f"new_session error: {e}")
+        return f"❌ Error: {e}"
+
+# ------------------------------------------------------------
+# REFERRAL HELPER (adds bonus to referrer)
 # ------------------------------------------------------------
 async def add_referral_bonus(referrer_id: int, context: ContextTypes.DEFAULT_TYPE = None):
     """Adds 30 minutes to referrer's expiry, re-adds to ALLOWED_USERS if needed."""
     now = time.time()
-    # If they have an existing expiry, extend it; otherwise set a new one
     current_expiry = USER_EXPIRY.get(referrer_id, now)
-    # If already expired, start from now to avoid negative time
     if current_expiry < now:
         current_expiry = now
     new_expiry = current_expiry + REFERRAL_BONUS_SECONDS
     USER_EXPIRY[referrer_id] = new_expiry
-    ALLOWED_USERS.add(referrer_id)   # ensures they are active
-    # Update referral count
+    ALLOWED_USERS.add(referrer_id)
     REFERRAL_COUNT[referrer_id] = REFERRAL_COUNT.get(referrer_id, 0) + 1
-    # Notify referrer if we have a bot context
     if context:
         try:
             until = datetime.fromtimestamp(new_expiry).strftime("%Y-%m-%d %H:%M")
@@ -364,7 +391,7 @@ async def add_referral_bonus(referrer_id: int, context: ContextTypes.DEFAULT_TYP
             pass
 
 # ------------------------------------------------------------
-# BOT HANDLERS (start command extended for referrals)
+# BOT HANDLERS
 # ------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -374,35 +401,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     referrer_id = None
     if context.args and context.args[0].startswith('ref_'):
         try:
-            ref_code = context.args[0][4:]  # remove 'ref_' prefix
+            ref_code = context.args[0][4:]
             referrer_id = int(ref_code)
         except ValueError:
             referrer_id = None
 
     # If this is a new user joining via referral, give them trial access
     if referrer_id is not None and user_id not in ALLOWED_USERS and user_id not in USER_EXPIRY:
-        # Prevent self-referral
         if referrer_id == user_id:
             await update.message.reply_text("You can't refer yourself.")
-        # Only allow one referral per user (prevent re-use)
         elif user_id in REFERRED_BY:
             await update.message.reply_text("You have already joined via a referral link.")
         else:
-            # Grant new user 30 min trial
             ALLOWED_USERS.add(user_id)
             USER_EXPIRY[user_id] = time.time() + NEW_USER_TRIAL_SECONDS
             REFERRED_BY[user_id] = referrer_id
             await update.message.reply_text(
                 "🎁 You received 30 minutes of free access for joining via a referral!"
             )
-            # Give referrer their bonus (only if they are a known user)
             if referrer_id in ALLOWED_USERS or referrer_id in USER_EXPIRY:
                 await add_referral_bonus(referrer_id, context)
             else:
-                # Referrer not found – we can still store the referral, but no bonus
                 logger.info(f"Referral from unknown user {referrer_id} for {user_id}")
 
-    # ---- Original access check (admins & already-added users) ----
+    # ---- Original access check ----
     if not await check_access(user_id):
         await update.message.reply_text("⛔ Access denied. Use a referral link or contact admin.")
         return
