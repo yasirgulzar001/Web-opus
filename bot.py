@@ -22,8 +22,8 @@ import uvicorn
 # ============================================================
 # CONFIGURATION - EDIT THESE
 # ============================================================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"          # Replace with your bot token
-ADMIN_IDS = {1234567890}                   # Replace with your Telegram user ID(s)
+BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"          # Replace with your bot token
+ADMIN_IDS = {7590180047}                   # Replace with your Telegram user ID(s)
 OWNER_USERNAME = "@NEVER_DIE8"             # For display only
 
 # API endpoints
