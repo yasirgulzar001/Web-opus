@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+Telegram Bot + Mini App for Syntx.ai Claude Chat
+Uses ngrok for HTTPS on the Mini App.
+Now with viral referral system: 1 referral = 30 min extra access.
+"""
+
 import asyncio
 import hashlib
 import hmac
@@ -7,8 +14,8 @@ import os
 import re
 import tempfile
 import time
-from datetime import datetime, timedelta
-from typing import Dict, Optional, Any
+from datetime import datetime
+from typing import Dict, Optional
 from urllib.parse import unquote
 
 import cloudscraper
@@ -20,13 +27,15 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import uvicorn
 
 # ============================================================
-# CONFIGURATION - EDIT THESE
+# CONFIGURATION – EDIT THESE TWO VALUES
 # ============================================================
-BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"          # Replace with your bot token
-ADMIN_IDS = {7590180047}                   # Replace with your Telegram user ID(s)
-OWNER_USERNAME = "@NEVER_DIE8"             # For display only
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"          # Replace with your bot token from @BotFather
+ADMIN_IDS = {1234567890}                   # Replace with your Telegram numeric user ID
 
-# API endpoints
+# After you start ngrok, you must update the Mini App URL in the /start command below.
+# ============================================================
+
+# External APIs
 EMAIL_API = "https://zecora0.serv00.net/Gmail.php"
 SYNTX_AUTH_SEND_OTP = "https://api.syntx.ai/api/v1/auth/email/send-otp"
 SYNTX_AUTH_VERIFY_OTP = "https://api.syntx.ai/api/v1/auth/email/verify-otp"
@@ -51,20 +60,26 @@ MODELS = [
     ("claude-sonnet-4-20250514", "Claude 4 Sonnet"),
 ]
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
+# ------------------------------------------------------------
+# Referral system additions (do not break core logic)
+# ------------------------------------------------------------
+REFERRAL_BONUS_SECONDS = 1800          # 30 minutes per successful referral
+NEW_USER_TRIAL_SECONDS = 1800          # new user gets 30 min trial when joining via referral
+REFERRED_BY: Dict[int, int] = {}       # user_id -> referrer_id
+REFERRAL_COUNT: Dict[int, int] = {}    # referrer_id -> number of successful invites
+
+# ------------------------------------------------------------
 ALLOWED_USERS: set[int] = set(ADMIN_IDS)
-USER_EXPIRY: Dict[int, float] = {}          # user_id -> expiry timestamp
-USER_SESSIONS: Dict[int, Dict] = {}         # active sessions
+USER_EXPIRY: Dict[int, float] = {}
+USER_SESSIONS: Dict[int, dict] = {}
 
 scraper = cloudscraper.create_scraper()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# MINI APP HTML (embedded)
-# ============================================================
+# ------------------------------------------------------------
+# MINI APP HTML (unchanged)
+# ------------------------------------------------------------
 MINI_APP_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -197,10 +212,10 @@ MINI_APP_HTML = """
 </html>
 """
 
-# ============================================================
-# HELPERS (email, OTP, Syntx APIs)
-# ============================================================
-async def create_email() -> tuple[str, str]:
+# ------------------------------------------------------------
+# HELPERS (unchanged)
+# ------------------------------------------------------------
+async def create_email():
     resp = scraper.get(f"{EMAIL_API}?action=create", timeout=HTTP_TIMEOUT)
     if resp.status_code != 200:
         raise Exception("Email creation failed")
@@ -303,9 +318,9 @@ async def fetch_reply_api(token: str, chat_uuid: str, after_id: int) -> Optional
         await asyncio.sleep(POLL_INTERVAL)
     return None
 
-# ============================================================
-# ACCESS CONTROL
-# ============================================================
+# ------------------------------------------------------------
+# ACCESS CONTROL (unchanged except used by new referral logic)
+# ------------------------------------------------------------
 async def check_access(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
@@ -319,55 +334,141 @@ async def check_access(user_id: int) -> bool:
         return False
     return True
 
-async def new_session(uid: int) -> Optional[str]:
-    """Create a new Syntx.ai session for user. Returns error message or None."""
-    try:
-        email, mid = await create_email()
-        if not await send_otp_api(email):
-            return "❌ Failed to send OTP."
-        otp = await fetch_otp(email, mid)
-        if not otp:
-            return "❌ OTP not received."
-        token = await verify_otp_api(email, otp)
-        if not token:
-            return "❌ OTP verification failed."
-        chat_uuid = await create_chat_api(token)
-        if not chat_uuid:
-            return "❌ Chat creation failed."
-        USER_SESSIONS[uid] = {
-            'email': email,
-            'token': token,
-            'chat_uuid': chat_uuid,
-            'model_id': 'claude-sonnet-5',
-            'model_name': 'Claude Sonnet 5',
-            'last_message_id': 0,
-            'message_count': 0
-        }
-        return None
-    except Exception as e:
-        logger.error(f"new_session error: {e}")
-        return f"❌ Error: {e}"
+# ------------------------------------------------------------
+# NEW: helper to add referral bonus to a referrer
+# ------------------------------------------------------------
+async def add_referral_bonus(referrer_id: int, context: ContextTypes.DEFAULT_TYPE = None):
+    """Adds 30 minutes to referrer's expiry, re-adds to ALLOWED_USERS if needed."""
+    now = time.time()
+    # If they have an existing expiry, extend it; otherwise set a new one
+    current_expiry = USER_EXPIRY.get(referrer_id, now)
+    # If already expired, start from now to avoid negative time
+    if current_expiry < now:
+        current_expiry = now
+    new_expiry = current_expiry + REFERRAL_BONUS_SECONDS
+    USER_EXPIRY[referrer_id] = new_expiry
+    ALLOWED_USERS.add(referrer_id)   # ensures they are active
+    # Update referral count
+    REFERRAL_COUNT[referrer_id] = REFERRAL_COUNT.get(referrer_id, 0) + 1
+    # Notify referrer if we have a bot context
+    if context:
+        try:
+            until = datetime.fromtimestamp(new_expiry).strftime("%Y-%m-%d %H:%M")
+            await context.bot.send_message(
+                referrer_id,
+                f"🎉 Someone joined with your referral link!\n"
+                f"You received +30 minutes of access.\n"
+                f"Your access is now valid until {until}."
+            )
+        except Exception:
+            pass
 
-# ============================================================
-# TELEGRAM BOT HANDLERS
-# ============================================================
+# ------------------------------------------------------------
+# BOT HANDLERS (start command extended for referrals)
+# ------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not await check_access(user.id):
-        await update.message.reply_text("⛔ Access denied. Contact admin.")
+    user_id = user.id
+
+    # --- Referral detection ---
+    referrer_id = None
+    if context.args and context.args[0].startswith('ref_'):
+        try:
+            ref_code = context.args[0][4:]  # remove 'ref_' prefix
+            referrer_id = int(ref_code)
+        except ValueError:
+            referrer_id = None
+
+    # If this is a new user joining via referral, give them trial access
+    if referrer_id is not None and user_id not in ALLOWED_USERS and user_id not in USER_EXPIRY:
+        # Prevent self-referral
+        if referrer_id == user_id:
+            await update.message.reply_text("You can't refer yourself.")
+        # Only allow one referral per user (prevent re-use)
+        elif user_id in REFERRED_BY:
+            await update.message.reply_text("You have already joined via a referral link.")
+        else:
+            # Grant new user 30 min trial
+            ALLOWED_USERS.add(user_id)
+            USER_EXPIRY[user_id] = time.time() + NEW_USER_TRIAL_SECONDS
+            REFERRED_BY[user_id] = referrer_id
+            await update.message.reply_text(
+                "🎁 You received 30 minutes of free access for joining via a referral!"
+            )
+            # Give referrer their bonus (only if they are a known user)
+            if referrer_id in ALLOWED_USERS or referrer_id in USER_EXPIRY:
+                await add_referral_bonus(referrer_id, context)
+            else:
+                # Referrer not found – we can still store the referral, but no bonus
+                logger.info(f"Referral from unknown user {referrer_id} for {user_id}")
+
+    # ---- Original access check (admins & already-added users) ----
+    if not await check_access(user_id):
+        await update.message.reply_text("⛔ Access denied. Use a referral link or contact admin.")
         return
-    err = await new_session(user.id)
+
+    # ---- Session creation ----
+    err = await new_session(user_id)
     if err:
         await update.message.reply_text(err)
         return
+
+    # ---------- CHANGE THIS URL AFTER YOU START NGROK ----------
+    mini_app_url = "https://YOUR_NGROK_URL.ngrok-free.app/mini-app"
+    # -----------------------------------------------------------
+
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Open Web Chat", web_app=WebAppInfo(url="https://your-domain.com/mini-app"))]
+        [InlineKeyboardButton("💬 Open Web Chat", web_app=WebAppInfo(url=mini_app_url))]
     ])
-    await update.message.reply_text(
-        "✅ Session started! Chat here or use the Mini App.",
-        reply_markup=keyboard
+
+    help_text = (
+        "🤖 *Claude Chat Bot Commands*\n\n"
+        "/start – Start a new session\n"
+        "/model number – Choose Claude model\n"
+        "/new – Reset session (fresh credentials)\n"
+        "/myref – Show your referral link & stats\n"
+        "/help – Show this help\n\n"
+        "📌 *Usage:*\n"
+        "Send a text message, or a photo with optional caption.\n"
+        "The bot will reply using the selected Claude model."
     )
 
+    await update.message.reply_text("✅ Session started! Chat here or use the Mini App.")
+    await update.message.reply_text(help_text, parse_mode=constants.ParseMode.MARKDOWN)
+    await update.message.reply_text("✨ You can also use the Mini App:", reply_markup=keyboard)
+
+# ------------------------------------------------------------
+# New command: /myref – shows referral link and stats
+# ------------------------------------------------------------
+async def myref_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await check_access(user.id):
+        await update.message.reply_text("⛔ You don't have access to the bot yet.")
+        return
+
+    bot_username = (await context.bot.get_me()).username
+    referral_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
+    count = REFERRAL_COUNT.get(user.id, 0)
+
+    expiry = USER_EXPIRY.get(user.id)
+    if expiry:
+        remaining = max(0, expiry - time.time())
+        remaining_str = f"{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
+    else:
+        remaining_str = "unlimited (admin)"
+
+    msg = (
+        f"🔗 *Your referral link:*\n`{referral_link}`\n\n"
+        f"👥 People invited: {count}\n"
+        f"⏳ Access remaining: {remaining_str}\n\n"
+        f"Share this link – each user who joins gives you +30 minutes!"
+    )
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN,
+                                    disable_web_page_preview=True)
+
+# ------------------------------------------------------------
+# Other commands (unchanged)
+# ------------------------------------------------------------
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_access(user.id) or user.id not in USER_SESSIONS:
@@ -398,12 +499,12 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Commands: /start, /model, /new, /help.\n"
-        "Send a text message or a photo with optional caption.\n"
-        "Use the Web App for a richer experience."
+        "Commands: /start, /model, /new, /myref, /help.\n"
+        "Send a text message or a photo with caption.\n"
+        "Use the Mini App for a full chat experience."
     )
 
-# ----- Admin Commands -----
+# Admin commands (unchanged)
 async def addid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
@@ -453,7 +554,10 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active = len(USER_SESSIONS)
     now = time.time()
     premium = sum(1 for u in ALLOWED_USERS if u not in ADMIN_IDS and USER_EXPIRY.get(u, 0) > now)
-    await update.message.reply_text(f"Active sessions: {active}\nPremium users: {premium}")
+    total_referrals = sum(REFERRAL_COUNT.values())
+    await update.message.reply_text(
+        f"Active sessions: {active}\nPremium users: {premium}\nTotal referrals: {total_referrals}"
+    )
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -471,7 +575,6 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     await update.message.reply_text(f"Sent to {sent} users.")
 
-# ----- Message handlers (text and photo) -----
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_access(user.id):
@@ -497,7 +600,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     reply = await fetch_reply_api(session['token'], session['chat_uuid'], msg_id)
     if reply:
-        # split long messages if needed
         for i in range(0, len(reply), 4000):
             await update.message.reply_text(reply[i:i+4000])
         session['message_count'] += 1
@@ -517,15 +619,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file = await update.message.photo[-1].get_file()
     caption = update.message.caption or ""
 
-    # Download photo
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
         await photo_file.download_to_memory()
         tmp.write(photo_file.download_as_bytearray())
         tmp_path = tmp.name
 
     await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.UPLOAD_PHOTO)
-
-    # Upload to Syntx
     img_url = await upload_image_api(session['token'], session['chat_uuid'], tmp_path)
     os.unlink(tmp_path)
 
@@ -560,13 +659,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ No reply received.")
 
-# ============================================================
-# FASTAPI APP (Mini App backend)
-# ============================================================
+# ------------------------------------------------------------
+# FASTAPI (unchanged)
+# ------------------------------------------------------------
 fastapi_app = FastAPI()
 
 def verify_init_data(init_data: str) -> Optional[int]:
-    """Verify Telegram WebApp initData, return user_id if valid."""
     try:
         parsed = dict(pair.split('=') for pair in init_data.split('&'))
         received_hash = parsed.pop('hash', '')
@@ -634,9 +732,9 @@ async def send_message_endpoint(request: Request):
 async def serve_mini_app():
     return MINI_APP_HTML
 
-# ============================================================
-# BACKGROUND TASK: expire old users
-# ============================================================
+# ------------------------------------------------------------
+# BACKGROUND TASK: expire users (unchanged)
+# ------------------------------------------------------------
 async def expire_loop():
     while True:
         now = time.time()
@@ -648,11 +746,10 @@ async def expire_loop():
             logger.info(f"Access expired for user {uid}")
         await asyncio.sleep(60)
 
-# ============================================================
-# MAIN
-# ============================================================
+# ------------------------------------------------------------
+# MAIN (register /myref command)
+# ------------------------------------------------------------
 async def main():
-    # Telegram bot application
     app = Application.builder().token(BOT_TOKEN).build()
 
     # User commands
@@ -660,16 +757,16 @@ async def main():
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    # Admin commands
+    app.add_handler(CommandHandler("myref", myref_cmd))   # <-- new referral command
+    # Admin
     app.add_handler(CommandHandler("addid", addid_cmd))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    # Message handlers
+    # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Start bot polling and FastAPI server concurrently
     await app.initialize()
     await app.start()
     asyncio.create_task(app.updater.start_polling())
