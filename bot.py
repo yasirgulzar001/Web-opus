@@ -29,8 +29,8 @@ import uvicorn
 # ============================================================
 # CONFIGURATION – EDIT THESE TWO VALUES
 # ============================================================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"          # Replace with your bot token from @BotFather
-ADMIN_IDS = {1234567890}                   # Replace with your Telegram numeric user ID
+BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"          # Replace with your bot token from @BotFather
+ADMIN_IDS = {7590180047}                   # Replace with your Telegram numeric user ID
 
 # After you start ngrok, you must update the Mini App URL in the /start command below.
 # ============================================================
