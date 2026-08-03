@@ -13,20 +13,20 @@ from urllib.parse import unquote
 
 import cloudscraper
 import requests
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import uvicorn
 
-# ------------ CONFIGURATION ------------
-BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"            # Replace
-ADMIN_IDS = {7590180047}                 # Your Telegram user ID (owner)
-OWNER_USERNAME = "@NEVER_DIE8"          # for display only
+# ============================================================
+# CONFIGURATION - EDIT THESE
+# ============================================================
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"          # Replace with your bot token
+ADMIN_IDS = {1234567890}                   # Replace with your Telegram user ID(s)
+OWNER_USERNAME = "@NEVER_DIE8"             # For display only
 
-# API endpoints (unchanged)
+# API endpoints
 EMAIL_API = "https://zecora0.serv00.net/Gmail.php"
 SYNTX_AUTH_SEND_OTP = "https://api.syntx.ai/api/v1/auth/email/send-otp"
 SYNTX_AUTH_VERIFY_OTP = "https://api.syntx.ai/api/v1/auth/email/verify-otp"
@@ -51,16 +51,20 @@ MODELS = [
     ("claude-sonnet-4-20250514", "Claude 4 Sonnet"),
 ]
 
-# ------------ GLOBAL STATE ------------
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 ALLOWED_USERS: set[int] = set(ADMIN_IDS)
 USER_EXPIRY: Dict[int, float] = {}          # user_id -> expiry timestamp
-USER_SESSIONS: Dict[int, Dict] = {}         # stores token, chat_uuid, model, etc.
+USER_SESSIONS: Dict[int, Dict] = {}         # active sessions
 
 scraper = cloudscraper.create_scraper()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ------------ MINI APP HTML (embedded) ------------
+# ============================================================
+# MINI APP HTML (embedded)
+# ============================================================
 MINI_APP_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -95,9 +99,7 @@ MINI_APP_HTML = """
   <div class="container">
     <div class="header">
       <h1>Claude Chat</h1>
-      <select id="modelSelect" class="model-select">
-        <!-- populated by JS -->
-      </select>
+      <select id="modelSelect" class="model-select"></select>
     </div>
     <div class="messages" id="messages"></div>
     <div class="status" id="status">Ready</div>
@@ -114,7 +116,6 @@ MINI_APP_HTML = """
     let userId = null;
     let currentModel = 'claude-sonnet-5';
 
-    // Load models
     async function loadModels() {
       const resp = await fetch(apiBase + '/models');
       const models = await resp.json();
@@ -136,7 +137,6 @@ MINI_APP_HTML = """
       });
     }
 
-    // Append message to chat
     function addMessage(text, sender) {
       const msgDiv = document.createElement('div');
       msgDiv.className = 'message ' + (sender === 'user' ? 'user-msg' : 'bot-msg');
@@ -145,7 +145,6 @@ MINI_APP_HTML = """
       document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
     }
 
-    // Send message
     async function sendMessage() {
       const input = document.getElementById('messageInput');
       const text = input.value.trim();
@@ -167,7 +166,6 @@ MINI_APP_HTML = """
       }
     }
 
-    // Initialise
     async function init() {
       try {
         const resp = await fetch(apiBase + '/init', {
@@ -199,87 +197,120 @@ MINI_APP_HTML = """
 </html>
 """
 
-# ------------ HELPERS (same as before but slightly adapted) ------------
-async def create_email():
+# ============================================================
+# HELPERS (email, OTP, Syntx APIs)
+# ============================================================
+async def create_email() -> tuple[str, str]:
     resp = scraper.get(f"{EMAIL_API}?action=create", timeout=HTTP_TIMEOUT)
-    if resp.status_code != 200: raise Exception("Email creation failed")
+    if resp.status_code != 200:
+        raise Exception("Email creation failed")
     data = resp.json()
-    if 'error' in data or not data.get('email'): raise Exception("Invalid email response")
+    if 'error' in data or not data.get('email'):
+        raise Exception("Invalid email response")
     return data['email'], data['id']
 
-async def fetch_otp(email: str, mailbox_id: str):
+async def fetch_otp(email: str, mailbox_id: str) -> Optional[str]:
     start = time.time()
     last_id = None
     while time.time() - start < OTP_TIMEOUT:
         try:
-            resp = scraper.get(f"{EMAIL_API}?action=get_messages&mailbox_id={mailbox_id}&email={email}", timeout=HTTP_TIMEOUT)
+            resp = scraper.get(
+                f"{EMAIL_API}?action=get_messages&mailbox_id={mailbox_id}&email={email}",
+                timeout=HTTP_TIMEOUT
+            )
             if resp.status_code == 200:
                 msgs = resp.json()
                 if msgs and isinstance(msgs, list):
                     first = msgs[0]
                     if first.get('id') != last_id:
                         last_id = first['id']
-                        body = first.get('html','') or first.get('text','') or first.get('body','')
+                        body = first.get('html', '') or first.get('text', '') or first.get('body', '')
                         match = re.search(r'\b(\d{6})\b', body)
-                        if match: return match.group(1)
-        except: pass
+                        if match:
+                            return match.group(1)
+        except Exception:
+            pass
         await asyncio.sleep(POLL_INTERVAL)
     return None
 
-async def send_otp_api(email: str):
-    resp = scraper.post(SYNTX_AUTH_SEND_OTP, json={"email":email,"ref_uuid":None,"utm":""},
-                        headers={"User-Agent":"Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"})
+async def send_otp_api(email: str) -> bool:
+    resp = scraper.post(
+        SYNTX_AUTH_SEND_OTP,
+        json={"email": email, "ref_uuid": None, "utm": ""},
+        headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"}
+    )
     return resp.status_code == 200 and resp.json().get('success')
 
-async def verify_otp_api(email: str, otp: str):
-    resp = scraper.post(SYNTX_AUTH_VERIFY_OTP, json={"email":email,"otp_code":otp,"ref_uuid":None,"utm":""},
-                        headers={"User-Agent":"Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"})
+async def verify_otp_api(email: str, otp: str) -> Optional[str]:
+    resp = scraper.post(
+        SYNTX_AUTH_VERIFY_OTP,
+        json={"email": email, "otp_code": otp, "ref_uuid": None, "utm": ""},
+        headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"}
+    )
     if resp.status_code == 200 and resp.json().get('success'):
         return resp.json().get('token')
     return None
 
-async def create_chat_api(token: str):
-    resp = scraper.post(SYNTX_CHATS, json={"title":"Claude Chat","scope":"text"},
-                        headers={"Authorization":f"Bearer {token}","User-Agent":"Mozilla/5.0"})
-    if resp.status_code == 201: return resp.json().get('uuid')
+async def create_chat_api(token: str) -> Optional[str]:
+    resp = scraper.post(
+        SYNTX_CHATS,
+        json={"title": "Claude Chat", "scope": "text"},
+        headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
+    )
+    if resp.status_code == 201:
+        return resp.json().get('uuid')
     return None
 
-async def upload_image_api(token: str, chat_uuid: str, file_path: str):
-    with open(file_path, 'rb') as f:
-        resp = requests.post(SYNTX_UPLOAD,
-                             data={"check_duplicates":"true","chat_uuid":chat_uuid},
-                             files={"files":(os.path.basename(file_path), f, 'application/octet-stream')},
-                             headers={"Authorization":f"Bearer {token}"},
-                             timeout=HTTP_TIMEOUT)
-    if resp.status_code == 200 and resp.json().get('successful',0) > 0:
-        return resp.json()['files'][0]['url']
+async def upload_image_api(token: str, chat_uuid: str, file_path: str) -> Optional[str]:
+    try:
+        with open(file_path, 'rb') as f:
+            resp = requests.post(
+                SYNTX_UPLOAD,
+                data={"check_duplicates": "true", "chat_uuid": chat_uuid},
+                files={"files": (os.path.basename(file_path), f, 'application/octet-stream')},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=HTTP_TIMEOUT
+            )
+        if resp.status_code == 200 and resp.json().get('successful', 0) > 0:
+            return resp.json()['files'][0]['url']
+    except Exception as e:
+        logger.error(f"Image upload failed: {e}")
     return None
 
-async def send_message_api(token: str, chat_uuid: str, objects: list):
-    resp = scraper.post(f"{SYNTX_CHATS}/{chat_uuid}/messages?ai_name=claude",
-                        json={"objects":objects},
-                        headers={"Authorization":f"Bearer {token}","User-Agent":"Mozilla/5.0"})
-    if resp.status_code == 200: return resp.json().get('id')
+async def send_message_api(token: str, chat_uuid: str, objects: list) -> Optional[int]:
+    resp = scraper.post(
+        f"{SYNTX_CHATS}/{chat_uuid}/messages?ai_name=claude",
+        json={"objects": objects},
+        headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
+    )
+    if resp.status_code == 200:
+        return resp.json().get('id')
     return None
 
-async def fetch_reply_api(token: str, chat_uuid: str, after_id: int):
+async def fetch_reply_api(token: str, chat_uuid: str, after_id: int) -> Optional[str]:
     start = time.time()
     while time.time() - start < REPLY_TIMEOUT:
-        resp = scraper.get(f"{SYNTX_CHATS}/{chat_uuid}/messages?page_size=20",
-                           headers={"Authorization":f"Bearer {token}","User-Agent":"Mozilla/5.0"})
+        resp = scraper.get(
+            f"{SYNTX_CHATS}/{chat_uuid}/messages?page_size=20",
+            headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
+        )
         if resp.status_code == 200:
-            for msg in resp.json().get('messages',[]):
-                if msg.get('author_id')==-1 and msg.get('id',0) > after_id:
-                    obj = msg.get('message_object',[{}])[0]
-                    if obj.get('object_type')=='text' and obj.get('completed'):
+            for msg in resp.json().get('messages', []):
+                if msg.get('author_id') == -1 and msg.get('id', 0) > after_id:
+                    obj = msg.get('message_object', [{}])[0]
+                    if obj.get('object_type') == 'text' and obj.get('completed'):
                         return obj.get('object_text')
         await asyncio.sleep(POLL_INTERVAL)
     return None
 
-# ------------ BOT HANDLERS ------------
+# ============================================================
+# ACCESS CONTROL
+# ============================================================
 async def check_access(user_id: int) -> bool:
-    if user_id in ADMIN_IDS: return True
-    if user_id not in ALLOWED_USERS: return False
+    if user_id in ADMIN_IDS:
+        return True
+    if user_id not in ALLOWED_USERS:
+        return False
     expiry = USER_EXPIRY.get(user_id)
     if expiry and time.time() > expiry:
         ALLOWED_USERS.discard(user_id)
@@ -288,6 +319,38 @@ async def check_access(user_id: int) -> bool:
         return False
     return True
 
+async def new_session(uid: int) -> Optional[str]:
+    """Create a new Syntx.ai session for user. Returns error message or None."""
+    try:
+        email, mid = await create_email()
+        if not await send_otp_api(email):
+            return "❌ Failed to send OTP."
+        otp = await fetch_otp(email, mid)
+        if not otp:
+            return "❌ OTP not received."
+        token = await verify_otp_api(email, otp)
+        if not token:
+            return "❌ OTP verification failed."
+        chat_uuid = await create_chat_api(token)
+        if not chat_uuid:
+            return "❌ Chat creation failed."
+        USER_SESSIONS[uid] = {
+            'email': email,
+            'token': token,
+            'chat_uuid': chat_uuid,
+            'model_id': 'claude-sonnet-5',
+            'model_name': 'Claude Sonnet 5',
+            'last_message_id': 0,
+            'message_count': 0
+        }
+        return None
+    except Exception as e:
+        logger.error(f"new_session error: {e}")
+        return f"❌ Error: {e}"
+
+# ============================================================
+# TELEGRAM BOT HANDLERS
+# ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_access(user.id):
@@ -297,69 +360,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if err:
         await update.message.reply_text(err)
         return
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💬 Open Web Chat", web_app=WebAppInfo(url="https://your-domain.com/mini-app"))
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Open Web Chat", web_app=WebAppInfo(url="https://your-domain.com/mini-app"))]
+    ])
     await update.message.reply_text(
         "✅ Session started! Chat here or use the Mini App.",
         reply_markup=keyboard
     )
 
-async def new_session(uid: int) -> Optional[str]:
-    try:
-        email, mid = await create_email()
-        if not await send_otp_api(email): return "❌ OTP send failed"
-        otp = await fetch_otp(email, mid)
-        if not otp: return "❌ OTP timeout"
-        token = await verify_otp_api(email, otp)
-        if not token: return "❌ OTP verification failed"
-        chat_uuid = await create_chat_api(token)
-        if not chat_uuid: return "❌ Chat creation failed"
-        USER_SESSIONS[uid] = {
-            'email': email,
-            'token': token,
-            'chat_uuid': chat_uuid,
-            'model_id': 'claude-sonnet-5',
-            'model_name': 'Claude Sonnet 5',
-            'last_message_id': 0,
-        }
-        return None
-    except Exception as e:
-        logger.error(f"new_session error: {e}")
-        return f"❌ Error: {e}"
-
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_access(user.id) or user.id not in USER_SESSIONS:
-        await update.message.reply_text("❌ No active session. /start")
+        await update.message.reply_text("❌ No active session. Use /start first.")
         return
     if not context.args:
-        models_list = "\n".join(f"{i+1}. {name}" for i,(_,name) in enumerate(MODELS))
+        models_list = "\n".join(f"{i+1}. {name}" for i, (_, name) in enumerate(MODELS))
         await update.message.reply_text(f"Models:\n{models_list}\nUse /model <number>")
         return
     try:
         idx = int(context.args[0]) - 1
-        if idx<0 or idx>=len(MODELS): raise ValueError
-    except:
-        await update.message.reply_text("❌ Invalid number")
+        if idx < 0 or idx >= len(MODELS):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number.")
         return
     mid, mname = MODELS[idx]
     USER_SESSIONS[user.id]['model_id'] = mid
     USER_SESSIONS[user.id]['model_name'] = mname
-    await update.message.reply_text(f"✅ Model: {mname}")
+    await update.message.reply_text(f"✅ Model set to: {mname}")
 
 async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not await check_access(user.id): return
+    if not await check_access(user.id):
+        return
     USER_SESSIONS.pop(user.id, None)
     await start(update, context)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Commands: /start, /model, /new, /help. Use Web App for better experience.")
+    await update.message.reply_text(
+        "Commands: /start, /model, /new, /help.\n"
+        "Send a text message or a photo with optional caption.\n"
+        "Use the Web App for a richer experience."
+    )
 
-# ------------ TIME-BASED ACCESS ------------
+# ----- Admin Commands -----
 async def addid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin adds a user for X hours."""
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
         return
@@ -369,66 +414,171 @@ async def addid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = int(context.args[0])
         hours = float(context.args[1])
-        if hours <= 0: raise ValueError
-    except:
+        if hours <= 0:
+            raise ValueError
+    except ValueError:
         await update.message.reply_text("❌ Invalid arguments.")
         return
-    expiry = time.time() + hours*3600
+    expiry = time.time() + hours * 3600
     ALLOWED_USERS.add(uid)
     USER_EXPIRY[uid] = expiry
     until = datetime.fromtimestamp(expiry).strftime("%Y-%m-%d %H:%M")
     await update.message.reply_text(f"✅ User {uid} added for {hours} hours (until {until}).")
     try:
         await context.bot.send_message(uid, f"🎉 You have been granted premium access for {hours} hours.")
-    except: pass
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
-    active = len(USER_SESSIONS)
-    now = time.time()
-    premium = sum(1 for u in ALLOWED_USERS if u not in ADMIN_IDS and USER_EXPIRY.get(u,0) > now)
-    await update.message.reply_text(f"Active sessions: {active}\nPremium users: {premium}")
+    except Exception:
+        pass
 
 async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
-    if not context.args: await update.message.reply_text("Usage: /removeuser <id>"); return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /removeuser <id>")
+        return
     try:
         uid = int(context.args[0])
-        if uid in ADMIN_IDS: await update.message.reply_text("Cannot remove admin."); return
+        if uid in ADMIN_IDS:
+            await update.message.reply_text("Cannot remove admin.")
+            return
         ALLOWED_USERS.discard(uid)
         USER_EXPIRY.pop(uid, None)
         USER_SESSIONS.pop(uid, None)
         await update.message.reply_text(f"✅ User {uid} removed.")
-    except: await update.message.reply_text("❌ Invalid ID")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID.")
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    active = len(USER_SESSIONS)
+    now = time.time()
+    premium = sum(1 for u in ALLOWED_USERS if u not in ADMIN_IDS and USER_EXPIRY.get(u, 0) > now)
+    await update.message.reply_text(f"Active sessions: {active}\nPremium users: {premium}")
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
-    if not context.args: await update.message.reply_text("Usage: /broadcast <msg>"); return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast <msg>")
+        return
     text = " ".join(context.args)
     sent = 0
     for uid in list(USER_SESSIONS.keys()):
-        try: await context.bot.send_message(uid, f"📢 {text}"); sent += 1
-        except: pass
+        try:
+            await context.bot.send_message(uid, f"📢 {text}")
+            sent += 1
+        except Exception:
+            pass
     await update.message.reply_text(f"Sent to {sent} users.")
 
-# ------------ MESSAGE HANDLERS (unchanged from previous bot) ------------
-# ... (include handle_message and handle_photo from previous code, with check_access)
-# For brevity, I'll assume they are present and correct.
+# ----- Message handlers (text and photo) -----
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await check_access(user.id):
+        await update.message.reply_text("⛔ Access denied.")
+        return
+    session = USER_SESSIONS.get(user.id)
+    if not session:
+        await update.message.reply_text("❌ No active session. Use /start.")
+        return
+    text = update.message.text.strip()
+    if not text:
+        return
+    objects = [{
+        "object_type": "text",
+        "object_url": None,
+        "object_text": text,
+        "model_type": session['model_id']
+    }]
+    await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.TYPING)
+    msg_id = await send_message_api(session['token'], session['chat_uuid'], objects)
+    if not msg_id:
+        await update.message.reply_text("❌ Failed to send message.")
+        return
+    reply = await fetch_reply_api(session['token'], session['chat_uuid'], msg_id)
+    if reply:
+        # split long messages if needed
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i+4000])
+        session['message_count'] += 1
+    else:
+        await update.message.reply_text("❌ No reply received.")
 
-# ------------ FASTAPI APP ------------
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await check_access(user.id):
+        await update.message.reply_text("⛔ Access denied.")
+        return
+    session = USER_SESSIONS.get(user.id)
+    if not session:
+        await update.message.reply_text("❌ No active session. Use /start.")
+        return
+
+    photo_file = await update.message.photo[-1].get_file()
+    caption = update.message.caption or ""
+
+    # Download photo
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        await photo_file.download_to_memory()
+        tmp.write(photo_file.download_as_bytearray())
+        tmp_path = tmp.name
+
+    await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.UPLOAD_PHOTO)
+
+    # Upload to Syntx
+    img_url = await upload_image_api(session['token'], session['chat_uuid'], tmp_path)
+    os.unlink(tmp_path)
+
+    if not img_url:
+        await update.message.reply_text("❌ Image upload failed.")
+        return
+
+    objects = []
+    if caption.strip():
+        objects.append({
+            "object_type": "text",
+            "object_url": None,
+            "object_text": caption,
+            "model_type": session['model_id']
+        })
+    objects.append({
+        "object_type": "image",
+        "object_url": img_url,
+        "object_text": os.path.basename(tmp_path),
+        "model_type": session['model_id']
+    })
+
+    msg_id = await send_message_api(session['token'], session['chat_uuid'], objects)
+    if not msg_id:
+        await update.message.reply_text("❌ Failed to send message.")
+        return
+    reply = await fetch_reply_api(session['token'], session['chat_uuid'], msg_id)
+    if reply:
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i+4000])
+        session['message_count'] += 1
+    else:
+        await update.message.reply_text("❌ No reply received.")
+
+# ============================================================
+# FASTAPI APP (Mini App backend)
+# ============================================================
 fastapi_app = FastAPI()
 
 def verify_init_data(init_data: str) -> Optional[int]:
-    """Verify Telegram initData and return user_id if valid."""
-    parsed = dict(pair.split('=') for pair in init_data.split('&'))
-    received_hash = parsed.pop('hash', '')
-    data_check_string = "\n".join(f"{k}={v}" for k,v in sorted(parsed.items()))
-    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-    if computed_hash != received_hash:
+    """Verify Telegram WebApp initData, return user_id if valid."""
+    try:
+        parsed = dict(pair.split('=') for pair in init_data.split('&'))
+        received_hash = parsed.pop('hash', '')
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if computed_hash != received_hash:
+            return None
+        user_data = json.loads(unquote(parsed.get('user', '{}')))
+        return user_data.get('id')
+    except Exception:
         return None
-    user_data = json.loads(unquote(parsed.get('user', '{}')))
-    return user_data.get('id')
 
 @fastapi_app.post("/api/init")
 async def init_endpoint(request: Request):
@@ -437,7 +587,6 @@ async def init_endpoint(request: Request):
     uid = verify_init_data(init_data)
     if not uid:
         raise HTTPException(status_code=403, detail="Invalid initData")
-    # Ensure user has an active session (if not, they need to /start in bot)
     if uid not in USER_SESSIONS:
         raise HTTPException(status_code=404, detail="No active session. Please /start in bot.")
     return {"user_id": uid}
@@ -451,12 +600,13 @@ async def set_model(request: Request):
     data = await request.json()
     uid = data.get('user_id')
     model_id = data.get('model_id')
-    if uid not in USER_SESSIONS: raise HTTPException(404)
-    USER_SESSIONS[uid]['model_id'] = model_id
-    # update display name
+    if uid not in USER_SESSIONS:
+        raise HTTPException(status_code=404)
+    session = USER_SESSIONS[uid]
+    session['model_id'] = model_id
     for mid, name in MODELS:
         if mid == model_id:
-            USER_SESSIONS[uid]['model_name'] = name
+            session['model_name'] = name
             break
     return {"status": "ok"}
 
@@ -465,7 +615,8 @@ async def send_message_endpoint(request: Request):
     data = await request.json()
     uid = data.get('user_id')
     text = data.get('text')
-    if uid not in USER_SESSIONS: raise HTTPException(404)
+    if uid not in USER_SESSIONS:
+        raise HTTPException(status_code=404)
     session = USER_SESSIONS[uid]
     objects = [{
         "object_type": "text",
@@ -483,7 +634,9 @@ async def send_message_endpoint(request: Request):
 async def serve_mini_app():
     return MINI_APP_HTML
 
-# ------------ BACKGROUND: expire old users ------------
+# ============================================================
+# BACKGROUND TASK: expire old users
+# ============================================================
 async def expire_loop():
     while True:
         now = time.time()
@@ -492,26 +645,31 @@ async def expire_loop():
             ALLOWED_USERS.discard(uid)
             USER_EXPIRY.pop(uid, None)
             USER_SESSIONS.pop(uid, None)
+            logger.info(f"Access expired for user {uid}")
         await asyncio.sleep(60)
 
-# ------------ MAIN ------------
+# ============================================================
+# MAIN
+# ============================================================
 async def main():
-    # Bot application
+    # Telegram bot application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Bot commands (add all handlers from previous code, plus new ones)
+    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    # Admin commands
     app.add_handler(CommandHandler("addid", addid_cmd))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    # message handlers (text + photo) – include handle_message, handle_photo
-    # ...
+    # Message handlers
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Run both bot polling and FastAPI server
+    # Start bot polling and FastAPI server concurrently
     await app.initialize()
     await app.start()
     asyncio.create_task(app.updater.start_polling())
