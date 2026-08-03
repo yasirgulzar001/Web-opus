@@ -3,3 +3,4 @@ cloudscraper
 requests
 fastapi
 uvicorn
+pyngrok
