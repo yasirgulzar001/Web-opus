@@ -32,7 +32,7 @@ from telegram.ext import (
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"
+BOT_TOKEN = "8799719369:AAGvETu47W87nRB6hqNPyUWMc"
 ADMIN_IDS = {6535041385}
 BOT_USERNAME = "PROBIxAichatbot"
 
