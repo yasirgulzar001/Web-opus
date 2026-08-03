@@ -1,35 +1,53 @@
 #!/usr/bin/env python3
 """
-Telegram Bot for Syntx.ai Claude Chat (Bot‑Only Version)
-- Text, photos, documents (txt, py, etc.)
-- Multiple Claude models
-- Time‑based access (/addid <user_id> <hours>)
-- Admin control
-No external URLs, no HTTPS, no ngrok required.
+Telegram Bot for Syntx.ai Claude Chat with Admin Control + Referral System
+
+Features:
+- Temporary email creation + auto OTP verification.
+- Multiple Claude models.
+- Text and photo messages (images uploaded to Syntx.ai first).
+- Per-user sessions with persistent token and chat UUID.
+- Admin commands: /adduser, /removeuser, /broadcast, /stats, /reset, /userid.
+- Time-limited user access (via /userid <id> <hours>).
+- Referral system: /referral to get your invite link.
+  - 1 successful referral = 30 min extra premium for the referrer.
+  - New user gets 60 min trial.
+- Owner: @NEVER_DIE8
 """
 
 import asyncio
 import logging
-import os
 import re
-import tempfile
+import os
+import sys
 import time
-from datetime import datetime
-from typing import Dict, Optional
+import tempfile
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
 
 import cloudscraper
 import requests
 from telegram import Update, constants
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
-# ============================================================
-# CONFIGURATION – EDIT THESE TWO VALUES
-# ============================================================
-BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"          # Your bot token from @BotFather
-ADMIN_IDS = {6535041385}                   # Your Telegram numeric ID
-# ============================================================
+# ------------------------------------------------------------
+# Configuration (move to a .env file in production)
+# ------------------------------------------------------------
+BOT_TOKEN = "8778402235:AAE_bQx95vdU2wkUQsCr8qxc1FCp-ICnhiY"          # Replace with your bot token
+ADMIN_IDS = {6535041385}                    # Replace with your Telegram user IDs
+BOT_USERNAME = "PROBIX_AIbot"      # Your bot's username (without @)
 
-# External APIs (unchanged)
+# Referral rewards (minutes)
+REFERRER_REWARD_MINUTES = 30       # Given to the referrer
+REFERREE_TRIAL_MINUTES = 60        # Given to the new user
+
+# API endpoints (same as before)
 EMAIL_API = "https://zecora0.serv00.net/Gmail.php"
 SYNTX_AUTH_SEND_OTP = "https://api.syntx.ai/api/v1/auth/email/send-otp"
 SYNTX_AUTH_VERIFY_OTP = "https://api.syntx.ai/api/v1/auth/email/verify-otp"
@@ -40,8 +58,7 @@ HTTP_TIMEOUT = 15
 OTP_TIMEOUT = 120
 REPLY_TIMEOUT = 120
 POLL_INTERVAL = 2
-MAX_FILE_SIZE_MB = 20
-MAX_TEXT_FILE_SIZE_MB = 5
+MAX_MESSAGES = 0
 
 MODELS = [
     ("claude-sonnet-5", "Claude Sonnet 5"),
@@ -56,323 +73,434 @@ MODELS = [
     ("claude-sonnet-4-20250514", "Claude 4 Sonnet"),
 ]
 
-# Text file extensions (read content directly)
-TEXT_FILE_EXTENSIONS = {
-    '.txt', '.py', '.log', '.md', '.json', '.xml', '.csv', '.yaml', '.ini',
-    '.cfg', '.sh', '.bat', '.js', '.ts', '.html', '.css', '.sql', '.r',
-    '.java', '.c', '.cpp', '.h', '.rb', '.go', '.rs', '.swift', '.kt',
-    '.php', '.pl', '.lua', '.conf', '.toml', '.env', '.gitignore',
-    '.dockerfile', '.makefile', '.cmake'
-}
-
-# ------------------------------------------------------------
-ALLOWED_USERS: set[int] = set(ADMIN_IDS)
-USER_EXPIRY: Dict[int, float] = {}
-USER_SESSIONS: Dict[int, dict] = {}
-
-scraper = cloudscraper.create_scraper()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
-# HELPERS
+# Global state (in-memory; add DB for production persistence)
 # ------------------------------------------------------------
-async def create_email():
-    resp = scraper.get(f"{EMAIL_API}?action=create", timeout=HTTP_TIMEOUT)
-    if resp.status_code != 200:
-        raise Exception("Email creation failed")
-    data = resp.json()
-    if 'error' in data or not data.get('email'):
-        raise Exception("Invalid email response")
-    return data['email'], data['id']
+# Allowed users: user_id -> expiry (None = permanent)
+ALLOWED_USERS: Dict[int, Optional[datetime]] = {uid: None for uid in ADMIN_IDS}
+
+# User sessions
+USER_SESSIONS: Dict[int, Dict[str, Any]] = {}
+
+# Referral statistics (optional, just for /referral display)
+REFERRAL_COUNT: Dict[int, int] = {}
+
+scraper = cloudscraper.create_scraper()
+
+# ------------------------------------------------------------
+# Whitelist helpers
+# ------------------------------------------------------------
+def is_allowed(user_id: int) -> bool:
+    """Check if user is allowed and not expired. Removes expired entries."""
+    expiry = ALLOWED_USERS.get(user_id)
+    if expiry is None:
+        return True
+    if expiry > datetime.now():
+        return True
+    # expired
+    ALLOWED_USERS.pop(user_id, None)
+    USER_SESSIONS.pop(user_id, None)
+    return False
+
+def extend_user_time(user_id: int, minutes: int):
+    """Add minutes to a user's expiry (only if they have a finite expiry)."""
+    if user_id not in ALLOWED_USERS or ALLOWED_USERS[user_id] is None:
+        # Permanent user or not in list – do nothing, but we could still add if new
+        return
+    current_expiry = ALLOWED_USERS[user_id]
+    if current_expiry is None:
+        return
+    new_expiry = max(current_expiry, datetime.now()) + timedelta(minutes=minutes)
+    ALLOWED_USERS[user_id] = new_expiry
+
+# ------------------------------------------------------------
+# Helper: send long messages
+# ------------------------------------------------------------
+async def send_long_message(update: Update, text: str, parse_mode: str = None):
+    max_len = 4000
+    for i in range(0, len(text), max_len):
+        chunk = text[i:i+max_len]
+        await update.message.reply_text(chunk, parse_mode=parse_mode)
+
+# ------------------------------------------------------------
+# Email & OTP (unchanged)
+# ------------------------------------------------------------
+async def create_email() -> tuple[str, str]:
+    try:
+        resp = scraper.get(f"{EMAIL_API}?action=create", timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            raise Exception(f"Status {resp.status_code}")
+        data = resp.json()
+        if "error" in data or not data.get("email"):
+            raise Exception("Invalid response")
+        return data["email"], data["id"]
+    except Exception as e:
+        logger.error(f"Email creation failed: {e}")
+        raise
 
 async def fetch_otp(email: str, mailbox_id: str) -> Optional[str]:
     start = time.time()
-    last_id = None
+    last_msg_id = None
     while time.time() - start < OTP_TIMEOUT:
         try:
             resp = scraper.get(
                 f"{EMAIL_API}?action=get_messages&mailbox_id={mailbox_id}&email={email}",
-                timeout=HTTP_TIMEOUT
+                timeout=HTTP_TIMEOUT,
             )
             if resp.status_code == 200:
-                msgs = resp.json()
-                if msgs and isinstance(msgs, list):
-                    first = msgs[0]
-                    if first.get('id') != last_id:
-                        last_id = first['id']
-                        body = first.get('html', '') or first.get('text', '') or first.get('body', '')
-                        match = re.search(r'\b(\d{6})\b', body)
+                messages = resp.json()
+                if messages and isinstance(messages, list):
+                    first = messages[0]
+                    msg_id = first.get("id")
+                    if msg_id != last_msg_id:
+                        last_msg_id = msg_id
+                        body = first.get("html", "") or first.get("text", "") or first.get("body", "")
+                        match = re.search(r"\b(\d{6})\b", body)
                         if match:
                             return match.group(1)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"OTP poll error: {e}")
         await asyncio.sleep(POLL_INTERVAL)
     return None
 
-async def send_otp_api(email: str) -> bool:
-    resp = scraper.post(
-        SYNTX_AUTH_SEND_OTP,
-        json={"email": email, "ref_uuid": None, "utm": ""},
-        headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"}
-    )
-    return resp.status_code == 200 and resp.json().get('success')
-
-async def verify_otp_api(email: str, otp: str) -> Optional[str]:
-    resp = scraper.post(
-        SYNTX_AUTH_VERIFY_OTP,
-        json={"email": email, "otp_code": otp, "ref_uuid": None, "utm": ""},
-        headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"}
-    )
-    if resp.status_code == 200 and resp.json().get('success'):
-        return resp.json().get('token')
-    return None
-
-async def create_chat_api(token: str) -> Optional[str]:
-    resp = scraper.post(
-        SYNTX_CHATS,
-        json={"title": "Claude Chat", "scope": "text"},
-        headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
-    )
-    if resp.status_code == 201:
-        return resp.json().get('uuid')
-    return None
-
-async def upload_file_to_syntx(token: str, chat_uuid: str, file_path: str) -> Optional[str]:
+# ------------------------------------------------------------
+# Syntx.ai API calls (unchanged)
+# ------------------------------------------------------------
+async def send_otp(email: str) -> bool:
     try:
-        with open(file_path, 'rb') as f:
+        resp = scraper.post(
+            SYNTX_AUTH_SEND_OTP,
+            json={"email": email, "ref_uuid": None, "utm": ""},
+            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"},
+            timeout=HTTP_TIMEOUT,
+        )
+        return resp.status_code == 200 and resp.json().get("success")
+    except Exception as e:
+        logger.error(f"send_otp error: {e}")
+        return False
+
+async def verify_otp(email: str, otp: str) -> Optional[str]:
+    try:
+        resp = scraper.post(
+            SYNTX_AUTH_VERIFY_OTP,
+            json={"email": email, "otp_code": otp, "ref_uuid": None, "utm": ""},
+            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code == 200 and resp.json().get("success"):
+            return resp.json().get("token")
+    except Exception as e:
+        logger.error(f"verify_otp error: {e}")
+    return None
+
+async def create_chat(token: str, title: str = "Claude Chat") -> Optional[str]:
+    try:
+        resp = scraper.post(
+            SYNTX_CHATS,
+            json={"title": title, "scope": "text"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+            },
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code == 201:
+            return resp.json().get("uuid")
+    except Exception as e:
+        logger.error(f"create_chat error: {e}")
+    return None
+
+async def upload_image(token: str, chat_uuid: str, file_path: str) -> Optional[str]:
+    try:
+        with open(file_path, "rb") as f:
+            files = {"files": (os.path.basename(file_path), f, "application/octet-stream")}
+            data = {"check_duplicates": "true", "chat_uuid": chat_uuid}
             resp = requests.post(
                 SYNTX_UPLOAD,
-                data={"check_duplicates": "true", "chat_uuid": chat_uuid},
-                files={"files": (os.path.basename(file_path), f, 'application/octet-stream')},
+                data=data,
+                files=files,
                 headers={"Authorization": f"Bearer {token}"},
-                timeout=HTTP_TIMEOUT
+                timeout=HTTP_TIMEOUT,
             )
-        if resp.status_code == 200 and resp.json().get('successful', 0) > 0:
-            return resp.json()['files'][0]['url']
+            if resp.status_code == 200 and resp.json().get("successful", 0) > 0:
+                return resp.json()["files"][0]["url"]
     except Exception as e:
-        logger.error(f"File upload failed: {e}")
+        logger.error(f"Image upload error: {e}")
     return None
 
-async def send_message_api(token: str, chat_uuid: str, objects: list) -> Optional[int]:
-    resp = scraper.post(
-        f"{SYNTX_CHATS}/{chat_uuid}/messages?ai_name=claude",
-        json={"objects": objects},
-        headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
-    )
-    if resp.status_code == 200:
-        return resp.json().get('id')
-    return None
-
-async def fetch_reply_api(token: str, chat_uuid: str, after_id: int) -> Optional[str]:
-    start = time.time()
-    while time.time() - start < REPLY_TIMEOUT:
-        resp = scraper.get(
-            f"{SYNTX_CHATS}/{chat_uuid}/messages?page_size=20",
-            headers={"Authorization": f"Bearer {token}", "User-Agent": "Mozilla/5.0"}
+async def send_message(token: str, chat_uuid: str, objects: list) -> Optional[int]:
+    try:
+        resp = scraper.post(
+            f"{SYNTX_CHATS}/{chat_uuid}/messages?ai_name=claude",
+            json={"objects": objects},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+            },
+            timeout=HTTP_TIMEOUT,
         )
         if resp.status_code == 200:
-            for msg in resp.json().get('messages', []):
-                if msg.get('author_id') == -1 and msg.get('id', 0) > after_id:
-                    obj = msg.get('message_object', [{}])[0]
-                    if obj.get('object_type') == 'text' and obj.get('completed'):
-                        return obj.get('object_text')
+            return resp.json().get("id")
+    except Exception as e:
+        logger.error(f"send_message error: {e}")
+    return None
+
+async def fetch_reply(
+    token: str, chat_uuid: str, after_id: int, timeout: int = REPLY_TIMEOUT
+) -> Optional[str]:
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            resp = scraper.get(
+                f"{SYNTX_CHATS}/{chat_uuid}/messages?page_size=20",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
+                },
+                timeout=HTTP_TIMEOUT,
+            )
+            if resp.status_code == 200:
+                messages = resp.json().get("messages", [])
+                for msg in messages:
+                    if msg.get("author_id") == -1 and msg.get("id", 0) > after_id:
+                        obj = msg.get("message_object", [{}])[0]
+                        if obj.get("object_type") == "text" and obj.get("completed"):
+                            return obj.get("object_text")
+        except Exception as e:
+            logger.warning(f"fetch_reply error: {e}")
         await asyncio.sleep(POLL_INTERVAL)
     return None
 
 # ------------------------------------------------------------
-# FILE HANDLING
+# Session management (unchanged)
 # ------------------------------------------------------------
-def is_text_file(filename: str) -> bool:
-    ext = os.path.splitext(filename)[1].lower()
-    return ext in TEXT_FILE_EXTENSIONS
-
-async def read_file_content(file_path: str) -> Optional[str]:
+async def new_session(chat_id: int) -> Optional[str]:
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return f.read()
-    except UnicodeDecodeError:
-        try:
-            with open(file_path, 'r', encoding='latin-1') as f:
-                return f.read()
-        except Exception:
-            return None
-    except Exception:
-        return None
-
-async def process_document(update: Update, session: dict) -> Optional[list]:
-    doc = update.message.document
-    file_size_mb = doc.file_size / (1024 * 1024) if doc.file_size else 0
-    file_name = doc.file_name or f"file_{int(time.time())}"
-
-    if file_size_mb > MAX_FILE_SIZE_MB:
-        await update.message.reply_text(f"❌ File too large ({file_size_mb:.1f} MB). Max {MAX_FILE_SIZE_MB} MB.")
-        return None
-
-    file = await doc.get_file()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp:
-        await file.download_to_memory()
-        tmp.write(file.download_as_bytearray())
-        tmp_path = tmp.name
-
-    objects = []
-
-    if is_text_file(file_name) and file_size_mb < MAX_TEXT_FILE_SIZE_MB:
-        content = await read_file_content(tmp_path)
-        if content is not None:
-            caption = update.message.caption or ""
-            text_content = f"📄 File: {file_name}\n"
-            if caption:
-                text_content += f"Caption: {caption}\n\n"
-            text_content += f"```\n{content[:50000]}\n```"
-            objects.append({
-                "object_type": "text",
-                "object_url": None,
-                "object_text": text_content,
-                "model_type": session['model_id']
-            })
-            os.unlink(tmp_path)
-            return objects
-
-    await update.message.reply_text("📎 Uploading file...")
-    file_url = await upload_file_to_syntx(session['token'], session['chat_uuid'], tmp_path)
-    os.unlink(tmp_path)
-
-    if not file_url:
-        await update.message.reply_text("❌ File upload failed.")
-        return None
-
-    caption = update.message.caption or ""
-    if caption:
-        objects.append({
-            "object_type": "text",
-            "object_url": None,
-            "object_text": caption,
-            "model_type": session['model_id']
-        })
-
-    objects.append({
-        "object_type": "file",
-        "object_url": file_url,
-        "object_text": file_name,
-        "model_type": session['model_id']
-    })
-
-    return objects
-
-# ------------------------------------------------------------
-# ACCESS CONTROL
-# ------------------------------------------------------------
-async def check_access(user_id: int) -> bool:
-    if user_id in ADMIN_IDS:
-        return True
-    if user_id not in ALLOWED_USERS:
-        return False
-    expiry = USER_EXPIRY.get(user_id)
-    if expiry and time.time() > expiry:
-        ALLOWED_USERS.discard(user_id)
-        USER_EXPIRY.pop(user_id, None)
-        USER_SESSIONS.pop(user_id, None)
-        return False
-    return True
-
-async def new_session(uid: int) -> Optional[str]:
-    try:
-        email, mid = await create_email()
-        if not await send_otp_api(email):
+        email, mailbox_id = await create_email()
+        if not await send_otp(email):
             return "❌ Failed to send OTP."
-        otp = await fetch_otp(email, mid)
+        otp = await fetch_otp(email, mailbox_id)
         if not otp:
-            return "❌ OTP not received."
-        token = await verify_otp_api(email, otp)
+            return "❌ OTP not received in time."
+        token = await verify_otp(email, otp)
         if not token:
             return "❌ OTP verification failed."
-        chat_uuid = await create_chat_api(token)
+        chat_uuid = await create_chat(token)
         if not chat_uuid:
-            return "❌ Chat creation failed."
-        USER_SESSIONS[uid] = {
-            'email': email,
-            'token': token,
-            'chat_uuid': chat_uuid,
-            'model_id': 'claude-sonnet-5',
-            'model_name': 'Claude Sonnet 5',
-            'last_message_id': 0,
-            'message_count': 0
+            return "❌ Failed to create chat."
+        USER_SESSIONS[chat_id] = {
+            "email": email,
+            "token": token,
+            "chat_uuid": chat_uuid,
+            "model_id": "claude-sonnet-5",
+            "model_name": "Claude Sonnet 5",
+            "message_count": 0,
+            "last_message_id": 0,
+            "active": True,
         }
         return None
     except Exception as e:
-        logger.error(f"new_session error: {e}")
-        return f"❌ Error: {e}"
+        logger.error(f"new_session exception: {e}")
+        return f"❌ Internal error: {e}"
 
 # ------------------------------------------------------------
-# BOT HANDLERS
+# Command handlers
 # ------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start with optional referral code."""
     user = update.effective_user
-    if not await check_access(user.id):
-        await update.message.reply_text("⛔ Access denied. Contact admin.")
+    args = context.args  # list of words after /start
+
+    # 1. Check if user is already allowed (even if expired, is_allowed will clean)
+    if is_allowed(user.id):
+        # Already authorized, just start session (ignore referral if any)
+        err = await new_session(user.id)
+        if err:
+            await update.message.reply_text(err)
+            return
+        await update.message.reply_text(
+            "✅ Session started!\n"
+            "Model: Claude Sonnet 5 (change with /model)\n"
+            "Send a message or a photo with optional caption.\n"
+            "Type /help for commands."
+        )
         return
 
+    # 2. User NOT authorized yet – check for referral code
+    referral_processed = False
+    if args and args[0].startswith("ref_"):
+        try:
+            referrer_id = int(args[0][4:])  # remove "ref_"
+            if referrer_id == user.id:
+                await update.message.reply_text("❌ You cannot refer yourself.")
+                return
+            if referrer_id in ALLOWED_USERS:
+                # Valid referrer – give new user trial time
+                expiry = datetime.now() + timedelta(minutes=REFERREE_TRIAL_MINUTES)
+                ALLOWED_USERS[user.id] = expiry
+
+                # Give referrer bonus
+                extend_user_time(referrer_id, REFERRER_REWARD_MINUTES)
+                REFERRAL_COUNT[referrer_id] = REFERRAL_COUNT.get(referrer_id, 0) + 1
+
+                # Notify referrer (optional)
+                try:
+                    await context.bot.send_message(
+                        chat_id=referrer_id,
+                        text=(
+                            f"🎉 New referral! User {user.mention_html()} joined using your link.\n"
+                            f"➕ You earned {REFERRER_REWARD_MINUTES} minutes of premium.\n"
+                            f"Your new expiry: {ALLOWED_USERS[referrer_id].strftime('%Y-%m-%d %H:%M') if ALLOWED_USERS[referrer_id] else 'Permanent'}"
+                        ),
+                        parse_mode=constants.ParseMode.HTML,
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not notify referrer {referrer_id}: {e}")
+
+                referral_processed = True
+            else:
+                await update.message.reply_text("❌ Invalid referral link. The referrer is not a valid user.")
+                return
+        except (ValueError, IndexError):
+            await update.message.reply_text("❌ Invalid referral code format.")
+            return
+
+    if not referral_processed:
+        # No valid referral – show the beautiful unauthorized message
+        await update.message.reply_text(
+            "⛔ <b>Access Denied</b>\n\n"
+            "🔹 <b>To get premium access:</b>\n"
+            "   📩 Contact <a href='https://t.me/NEVER_DIE8'>@NEVER_DIE8</a>\n\n"
+            "🔹 <b>Or use a referral link</b> from an existing user.\n"
+            "   👥 Get 1 hour free trial + 30 min bonus for your inviter!\n"
+            "   🔗 Ask a friend for their invite link, or type /referral if you already have access.",
+            parse_mode=constants.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    # Referral processed – start session for the new user
     err = await new_session(user.id)
     if err:
         await update.message.reply_text(err)
         return
 
-    help_text = (
-        "🤖 *Claude Chat Bot Commands*\n\n"
-        "/start – Start a new session\n"
-        "/model number – Choose Claude model\n"
-        "/new – Reset session (fresh credentials)\n"
-        "/help – Show this help\n\n"
-        "📌 *Usage:*\n"
-        "Send a text message, photo, or document.\n"
-        "For .txt, .py and other text files, content is read directly.\n"
-        "Other files are uploaded and attached to the message."
+    await update.message.reply_text(
+        f"✅ Welcome! You received a <b>{REFERREE_TRIAL_MINUTES}-minute trial</b>.\n"
+        "Model: Claude Sonnet 5 (change with /model)\n"
+        "Send a message or a photo with optional caption.\n"
+        "Type /help for commands.",
+        parse_mode=constants.ParseMode.HTML,
     )
-    await update.message.reply_text("✅ Session started!")
-    await update.message.reply_text(help_text, parse_mode=constants.ParseMode.MARKDOWN)
+
+async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the user's referral link and stats."""
+    user = update.effective_user
+    if not is_allowed(user.id):
+        await update.message.reply_text(
+            "⛔ <b>You need premium to use referrals.</b>\n"
+            "Contact @NEVER_DIE8 to get access, or use someone else's referral link.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    link = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
+    count = REFERRAL_COUNT.get(user.id, 0)
+    expiry_info = ALLOWED_USERS.get(user.id)
+    if expiry_info is None:
+        expiry_str = "Permanent"
+    else:
+        expiry_str = expiry_info.strftime("%Y-%m-%d %H:%M UTC")
+
+    msg = (
+        f"🔗 <b>Your Referral Link</b>\n"
+        f"<code>{link}</code>\n\n"
+        f"👥 Successful referrals: {count}\n"
+        f"🕒 Your premium expiry: {expiry_str}\n\n"
+        f"📌 Earn <b>{REFERRER_REWARD_MINUTES} min</b> for each friend who joins using your link."
+    )
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not await check_access(user.id) or user.id not in USER_SESSIONS:
+    if not is_allowed(user.id) or user.id not in USER_SESSIONS:
         await update.message.reply_text("❌ No active session. Use /start first.")
         return
+
     if not context.args:
-        models_list = "\n".join(f"{i+1}. {name}" for i, (_, name) in enumerate(MODELS))
-        await update.message.reply_text(f"Models:\n{models_list}\nUse /model <number>")
+        models_text = "\n".join(f"{i+1}. {name}" for i, (_, name) in enumerate(MODELS))
+        await update.message.reply_text(
+            f"Available models:\n{models_text}\n\nUse /model <number> to select."
+        )
         return
     try:
         idx = int(context.args[0]) - 1
         if idx < 0 or idx >= len(MODELS):
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Invalid number.")
+        await update.message.reply_text("❌ Invalid model number.")
         return
-    mid, mname = MODELS[idx]
-    USER_SESSIONS[user.id]['model_id'] = mid
-    USER_SESSIONS[user.id]['model_name'] = mname
-    await update.message.reply_text(f"✅ Model set to: {mname}")
+
+    model_id, model_name = MODELS[idx]
+    session = USER_SESSIONS[user.id]
+    session["model_id"] = model_id
+    session["model_name"] = model_name
+    await update.message.reply_text(f"✅ Model set to: {model_name}")
 
 async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not await check_access(user.id):
+    if not is_allowed(user.id):
+        await update.message.reply_text("⛔ Unauthorized.")
         return
-    USER_SESSIONS.pop(user.id, None)
+    if user.id in USER_SESSIONS:
+        del USER_SESSIONS[user.id]
     await start(update, context)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Commands: /start, /model, /new, /help.\n"
-        "Send a text message, photo, or document."
-    )
+    cmds = """
+🤖 <b>Claude Chat Bot Commands</b>
 
-# Admin commands
-async def addid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+/start – Start a new session
+/model [number] – Choose Claude model
+/new – Reset session (fresh credentials)
+/referral – Get your referral link & stats
+/help – Show this help
+
+<b>Usage:</b>
+Send a text message, or a photo with optional caption.
+The bot will reply using the selected Claude model.
+    """
+    await update.message.reply_text(cmds, parse_mode=constants.ParseMode.HTML)
+
+# ------------------------------------------------------------
+# Admin commands (unchanged except minor updates)
+# ------------------------------------------------------------
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /adduser <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        ALLOWED_USERS[uid] = None   # permanent
+        await update.message.reply_text(f"✅ User {uid} added permanently.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+
+async def add_user_timed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
         return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /addid <user_id> <hours>")
+        await update.message.reply_text("Usage: /userid <user_id> <hours>")
         return
     try:
         uid = int(context.args[0])
@@ -380,90 +508,157 @@ async def addid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if hours <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Invalid arguments.")
+        await update.message.reply_text("❌ Invalid user ID or hours.")
         return
-    expiry = time.time() + hours * 3600
-    ALLOWED_USERS.add(uid)
-    USER_EXPIRY[uid] = expiry
-    until = datetime.fromtimestamp(expiry).strftime("%Y-%m-%d %H:%M")
-    await update.message.reply_text(f"✅ User {uid} added for {hours} hours (until {until}).")
-    try:
-        await context.bot.send_message(uid, f"🎉 You have been granted premium access for {hours} hours.")
-    except Exception:
-        pass
 
-async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    expiry = datetime.now() + timedelta(hours=hours)
+    ALLOWED_USERS[uid] = expiry
+    await update.message.reply_text(
+        f"✅ User {uid} added for {hours} hour(s). Expires at {expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC."
+    )
+
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: /removeuser <id>")
+        await update.message.reply_text("Usage: /removeuser <user_id>")
         return
     try:
         uid = int(context.args[0])
         if uid in ADMIN_IDS:
-            await update.message.reply_text("Cannot remove admin.")
+            await update.message.reply_text("❌ Cannot remove an admin.")
             return
-        ALLOWED_USERS.discard(uid)
-        USER_EXPIRY.pop(uid, None)
+        ALLOWED_USERS.pop(uid, None)
         USER_SESSIONS.pop(uid, None)
         await update.message.reply_text(f"✅ User {uid} removed.")
     except ValueError:
-        await update.message.reply_text("❌ Invalid ID.")
+        await update.message.reply_text("❌ Invalid user ID.")
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        return
-    active = len(USER_SESSIONS)
-    now = time.time()
-    premium = sum(1 for u in ALLOWED_USERS if u not in ADMIN_IDS and USER_EXPIRY.get(u, 0) > now)
-    await update.message.reply_text(f"Active sessions: {active}\nPremium users: {premium}")
-
-async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
         return
     if not context.args:
-        await update.message.reply_text("Usage: /broadcast <msg>")
+        await update.message.reply_text("Usage: /broadcast <message>")
         return
     text = " ".join(context.args)
     sent = 0
     for uid in list(USER_SESSIONS.keys()):
         try:
-            await context.bot.send_message(uid, f"📢 {text}")
+            await context.bot.send_message(chat_id=uid, text=f"📢 Broadcast:\n{text}")
             sent += 1
-        except Exception:
-            pass
-    await update.message.reply_text(f"Sent to {sent} users.")
+        except Exception as e:
+            logger.warning(f"Broadcast to {uid} failed: {e}")
+    await update.message.reply_text(f"✅ Broadcast sent to {sent} users.")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    now = datetime.now()
+    permanent = sum(1 for e in ALLOWED_USERS.values() if e is None)
+    timed_active = sum(1 for e in ALLOWED_USERS.values() if e is not None and e > now)
+    timed_expired = sum(1 for e in ALLOWED_USERS.values() if e is not None and e <= now)
+
+    await update.message.reply_text(
+        f"📊 Active sessions: {len(USER_SESSIONS)}\n"
+        f"👥 Whitelist:\n"
+        f"  - Permanent: {permanent}\n"
+        f"  - Timed (active): {timed_active}\n"
+        f"  - Timed (expired, will be removed): {timed_expired}\n"
+        f"🔗 Total referrals tracked: {sum(REFERRAL_COUNT.values())}"
+    )
+
+async def admin_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /reset <user_id>")
+        return
+    try:
+        uid = int(context.args[0])
+        if uid in USER_SESSIONS:
+            del USER_SESSIONS[uid]
+            await update.message.reply_text(f"✅ Session of user {uid} reset.")
+        else:
+            await update.message.reply_text("❌ No active session for that user.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
 
 # ------------------------------------------------------------
-# MESSAGE HANDLERS (text, photo, document)
+# Message handlers (unchanged)
 # ------------------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not await check_access(user.id):
-        await update.message.reply_text("⛔ Access denied.")
+    if not is_allowed(user.id):
+        await update.message.reply_text(
+            "⛔ <b>Access Denied</b>\n\n"
+            "🔹 <b>To get premium access:</b>\n"
+            "   📩 Contact <a href='https://t.me/NEVER_DIE8'>@NEVER_DIE8</a>\n\n"
+            "🔹 <b>Or use a referral link</b> from an existing user.\n"
+            "   👥 Get 1 hour free trial + 30 min bonus for your inviter!\n"
+            "   🔗 Ask a friend for their invite link, or type /referral if you already have access.",
+            parse_mode=constants.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
         return
+
     session = USER_SESSIONS.get(user.id)
-    if not session:
+    if not session or not session.get("active"):
         await update.message.reply_text("❌ No active session. Use /start.")
         return
-    text = update.message.text.strip()
-    if not text:
+
+    text = update.message.text
+    if not text.strip():
         return
-    objects = [{
-        "object_type": "text",
-        "object_url": None,
-        "object_text": text,
-        "model_type": session['model_id']
-    }]
-    await send_and_reply(update, session, objects, user.id, context)
+
+    objects = [
+        {
+            "object_type": "text",
+            "object_url": None,
+            "object_text": text,
+            "model_type": session["model_id"],
+        }
+    ]
+
+    await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.TYPING)
+    msg_id = await send_message(session["token"], session["chat_uuid"], objects)
+    if not msg_id:
+        await update.message.reply_text("❌ Failed to send message.")
+        return
+
+    reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
+    if reply:
+        await send_long_message(update, f"**{session['model_name']}:** {reply}",
+                                parse_mode=constants.ParseMode.MARKDOWN)
+        session["message_count"] += 1
+    else:
+        await update.message.reply_text("❌ No reply received (timeout).")
+
+    if MAX_MESSAGES > 0 and session["message_count"] >= MAX_MESSAGES:
+        await update.message.reply_text("⚠️ Message limit reached. Use /new to reset.")
+        session["active"] = False
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not await check_access(user.id):
-        await update.message.reply_text("⛔ Access denied.")
+    if not is_allowed(user.id):
+        await update.message.reply_text(
+            "⛔ <b>Access Denied</b>\n\n"
+            "🔹 <b>To get premium access:</b>\n"
+            "   📩 Contact <a href='https://t.me/NEVER_DIE8'>@NEVER_DIE8</a>\n\n"
+            "🔹 <b>Or use a referral link</b> from an existing user.\n"
+            "   👥 Get 1 hour free trial + 30 min bonus for your inviter!\n"
+            "   🔗 Ask a friend for their invite link, or type /referral if you already have access.",
+            parse_mode=constants.ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
         return
+
     session = USER_SESSIONS.get(user.id)
-    if not session:
+    if not session or not session.get("active"):
         await update.message.reply_text("❌ No active session. Use /start.")
         return
 
@@ -476,7 +671,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = tmp.name
 
     await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.UPLOAD_PHOTO)
-    img_url = await upload_file_to_syntx(session['token'], session['chat_uuid'], tmp_path)
+    img_url = await upload_image(session["token"], session["chat_uuid"], tmp_path)
     os.unlink(tmp_path)
 
     if not img_url:
@@ -489,85 +684,73 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "object_type": "text",
             "object_url": None,
             "object_text": caption,
-            "model_type": session['model_id']
+            "model_type": session["model_id"],
         })
     objects.append({
         "object_type": "image",
         "object_url": img_url,
         "object_text": os.path.basename(tmp_path),
-        "model_type": session['model_id']
+        "model_type": session["model_id"],
     })
 
-    await send_and_reply(update, session, objects, user.id, context)
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not await check_access(user.id):
-        await update.message.reply_text("⛔ Access denied.")
-        return
-    session = USER_SESSIONS.get(user.id)
-    if not session:
-        await update.message.reply_text("❌ No active session. Use /start.")
-        return
-
-    await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.TYPING)
-    objects = await process_document(update, session)
-    if objects is None:
-        return
-    await send_and_reply(update, session, objects, user.id, context)
-
-async def send_and_reply(update: Update, session: dict, objects: list, chat_id: int, context):
-    msg_id = await send_message_api(session['token'], session['chat_uuid'], objects)
+    msg_id = await send_message(session["token"], session["chat_uuid"], objects)
     if not msg_id:
         await update.message.reply_text("❌ Failed to send message.")
         return
-    reply = await fetch_reply_api(session['token'], session['chat_uuid'], msg_id)
+
+    reply = await fetch_reply(session["token"], session["chat_uuid"], msg_id)
     if reply:
-        for i in range(0, len(reply), 4000):
-            await context.bot.send_message(chat_id=chat_id, text=reply[i:i+4000])
-        session['message_count'] += 1
+        await send_long_message(update, f"**{session['model_name']}:** {reply}",
+                                parse_mode=constants.ParseMode.MARKDOWN)
+        session["message_count"] += 1
     else:
-        await context.bot.send_message(chat_id=chat_id, text="❌ No reply received.")
+        await update.message.reply_text("❌ No reply received.")
+
+    if MAX_MESSAGES > 0 and session["message_count"] >= MAX_MESSAGES:
+        await update.message.reply_text("⚠️ Message limit reached. Use /new to reset.")
+        session["active"] = False
 
 # ------------------------------------------------------------
-# BACKGROUND: expire users
+# Error handler
 # ------------------------------------------------------------
-async def expire_loop():
-    while True:
-        now = time.time()
-        to_remove = [uid for uid, exp in USER_EXPIRY.items() if exp <= now]
-        for uid in to_remove:
-            ALLOWED_USERS.discard(uid)
-            USER_EXPIRY.pop(uid, None)
-            USER_SESSIONS.pop(uid, None)
-            logger.info(f"Access expired for user {uid}")
-        await asyncio.sleep(60)
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(msg="Exception while handling update:", exc_info=context.error)
+    if update and update.effective_chat:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ An internal error occurred. Please try again.",
+        )
 
 # ------------------------------------------------------------
-# MAIN
+# Main
 # ------------------------------------------------------------
-async def main():
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     # User commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("referral", referral_cmd))
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    # Admin
-    app.add_handler(CommandHandler("addid", addid_cmd))
-    app.add_handler(CommandHandler("removeuser", removeuser_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    # Messages
+
+    # Admin commands
+    app.add_handler(CommandHandler("adduser", add_user))
+    app.add_handler(CommandHandler("userid", add_user_timed))
+    app.add_handler(CommandHandler("removeuser", remove_user))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("reset", admin_reset))
+
+    # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    await app.initialize()
-    await app.start()
-    asyncio.create_task(app.updater.start_polling())
-    await expire_loop()
+    # Error handler
+    app.add_error_handler(error_handler)
+
+    logger.info("Bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
