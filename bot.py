@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Telegram Bot + Mini App for Syntx.ai Claude Chat.
-Uses pyngrok to automatically create an HTTPS tunnel.
-All tokens are embedded (not secure – keep this file private).
+Telegram Bot for Syntx.ai Claude Chat (Bot‑Only Version)
+- Text, photos, documents (txt, py, etc.)
+- Multiple Claude models
+- Time‑based access (/addid <user_id> <hours>)
+- Admin control
+No external URLs, no HTTPS, no ngrok required.
 """
 
 import asyncio
-import hashlib
-import hmac
-import json
 import logging
 import os
 import re
@@ -16,28 +16,17 @@ import tempfile
 import time
 from datetime import datetime
 from typing import Dict, Optional
-from urllib.parse import unquote
 
 import cloudscraper
 import requests
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import Update, constants
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import uvicorn
-from pyngrok import ngrok, conf
 
 # ============================================================
-# CONFIGURATION – PUT YOUR OWN VALUES HERE
+# CONFIGURATION – EDIT THESE TWO VALUES
 # ============================================================
-BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"              # From @BotFather
-ADMIN_IDS = {6535041385}                       # Your Telegram numeric ID
-
-# ⚠️ NEVER SHARE THESE TOKENS ⚠️
-NGROK_AUTHTOKEN = "3HP88NjHElyptfGCFYWQEtwxcCK_42svz9Qv9E2Wxzs6NTECi"  # Replace with your new authtoken
-NGROK_STATIC_DOMAIN = "eats-sizzling-sturdy.ngrok-free.dev" # Your reserved free domain
-
-# After setting the domain once, you DON'T need to change anything else.
+BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"          # Your bot token from @BotFather
+ADMIN_IDS = {6535041385}                   # Your Telegram numeric ID
 # ============================================================
 
 # External APIs (unchanged)
@@ -51,6 +40,8 @@ HTTP_TIMEOUT = 15
 OTP_TIMEOUT = 120
 REPLY_TIMEOUT = 120
 POLL_INTERVAL = 2
+MAX_FILE_SIZE_MB = 20
+MAX_TEXT_FILE_SIZE_MB = 5
 
 MODELS = [
     ("claude-sonnet-5", "Claude Sonnet 5"),
@@ -65,6 +56,15 @@ MODELS = [
     ("claude-sonnet-4-20250514", "Claude 4 Sonnet"),
 ]
 
+# Text file extensions (read content directly)
+TEXT_FILE_EXTENSIONS = {
+    '.txt', '.py', '.log', '.md', '.json', '.xml', '.csv', '.yaml', '.ini',
+    '.cfg', '.sh', '.bat', '.js', '.ts', '.html', '.css', '.sql', '.r',
+    '.java', '.c', '.cpp', '.h', '.rb', '.go', '.rs', '.swift', '.kt',
+    '.php', '.pl', '.lua', '.conf', '.toml', '.env', '.gitignore',
+    '.dockerfile', '.makefile', '.cmake'
+}
+
 # ------------------------------------------------------------
 ALLOWED_USERS: set[int] = set(ADMIN_IDS)
 USER_EXPIRY: Dict[int, float] = {}
@@ -75,142 +75,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
-# MINI APP HTML (dark theme, chat UI)
-# ------------------------------------------------------------
-MINI_APP_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Claude Chat</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <style>
-    :root {
-      --bg: #1a1a2e; --surface: #16213e; --text: #e0e0e0;
-      --accent: #0f3460; --highlight: #e94560; --user-bg: #0f3460;
-      --bot-bg: #16213e; --border: #0f3460;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); }
-    .container { max-width: 700px; margin: auto; padding: 20px; display: flex; flex-direction: column; height: 100vh; }
-    .header { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); }
-    .header h1 { font-size: 1.5rem; color: var(--highlight); }
-    .model-select { background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 5px 10px; border-radius: 5px; }
-    .messages { flex: 1; overflow-y: auto; padding: 10px 0; }
-    .message { margin-bottom: 15px; padding: 10px 15px; border-radius: 15px; max-width: 80%; word-wrap: break-word; }
-    .user-msg { background: var(--user-bg); margin-left: auto; border-bottom-right-radius: 0; }
-    .bot-msg { background: var(--bot-bg); margin-right: auto; border-bottom-left-radius: 0; }
-    .input-area { display: flex; gap: 10px; padding: 10px 0; border-top: 1px solid var(--border); }
-    .input-area input { flex: 1; padding: 10px; border-radius: 20px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
-    .input-area button { background: var(--highlight); border: none; border-radius: 20px; padding: 10px 20px; color: white; cursor: pointer; }
-    .status { font-size: 0.8rem; color: #888; text-align: center; margin: 5px 0; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1>Claude Chat</h1>
-      <select id="modelSelect" class="model-select"></select>
-    </div>
-    <div class="messages" id="messages"></div>
-    <div class="status" id="status">Ready</div>
-    <div class="input-area">
-      <input type="text" id="messageInput" placeholder="Type a message..." autocomplete="off">
-      <button id="sendBtn">Send</button>
-    </div>
-  </div>
-  <script>
-    const tg = window.Telegram.WebApp;
-    tg.expand();
-
-    const apiBase = '/api';
-    let userId = null;
-    let currentModel = 'claude-sonnet-5';
-
-    async function loadModels() {
-      const resp = await fetch(apiBase + '/models');
-      const models = await resp.json();
-      const select = document.getElementById('modelSelect');
-      models.forEach(m => {
-        const opt = document.createElement('option');
-        opt.value = m.id;
-        opt.text = m.name;
-        select.appendChild(opt);
-      });
-      select.value = currentModel;
-      select.addEventListener('change', async () => {
-        currentModel = select.value;
-        await fetch(apiBase + '/set_model', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({user_id: userId, model_id: currentModel})
-        });
-      });
-    }
-
-    function addMessage(text, sender) {
-      const msgDiv = document.createElement('div');
-      msgDiv.className = 'message ' + (sender === 'user' ? 'user-msg' : 'bot-msg');
-      msgDiv.textContent = text;
-      document.getElementById('messages').appendChild(msgDiv);
-      document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
-    }
-
-    async function sendMessage() {
-      const input = document.getElementById('messageInput');
-      const text = input.value.trim();
-      if (!text) return;
-      input.value = '';
-      addMessage(text, 'user');
-      document.getElementById('status').textContent = 'Thinking...';
-      const resp = await fetch(apiBase + '/send_message', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({user_id: userId, text: text})
-      });
-      const data = await resp.json();
-      document.getElementById('status').textContent = 'Ready';
-      if (data.reply) {
-        addMessage(data.reply, 'bot');
-      } else {
-        addMessage('❌ No reply', 'bot');
-      }
-    }
-
-    async function init() {
-      try {
-        const resp = await fetch(apiBase + '/init', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({initData: tg.initData})
-        });
-        const data = await resp.json();
-        if (data.user_id) {
-          userId = data.user_id;
-          document.getElementById('status').textContent = 'Connected';
-          await loadModels();
-        } else {
-          document.getElementById('status').textContent = 'Auth failed';
-        }
-      } catch (e) {
-        document.getElementById('status').textContent = 'Error connecting';
-      }
-    }
-
-    document.getElementById('sendBtn').addEventListener('click', sendMessage);
-    document.getElementById('messageInput').addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') sendMessage();
-    });
-
-    init();
-  </script>
-</body>
-</html>
-"""
-
-# ------------------------------------------------------------
-# HELPERS (same as before)
+# HELPERS
 # ------------------------------------------------------------
 async def create_email():
     resp = scraper.get(f"{EMAIL_API}?action=create", timeout=HTTP_TIMEOUT)
@@ -273,7 +138,7 @@ async def create_chat_api(token: str) -> Optional[str]:
         return resp.json().get('uuid')
     return None
 
-async def upload_image_api(token: str, chat_uuid: str, file_path: str) -> Optional[str]:
+async def upload_file_to_syntx(token: str, chat_uuid: str, file_path: str) -> Optional[str]:
     try:
         with open(file_path, 'rb') as f:
             resp = requests.post(
@@ -286,7 +151,7 @@ async def upload_image_api(token: str, chat_uuid: str, file_path: str) -> Option
         if resp.status_code == 200 and resp.json().get('successful', 0) > 0:
             return resp.json()['files'][0]['url']
     except Exception as e:
-        logger.error(f"Image upload failed: {e}")
+        logger.error(f"File upload failed: {e}")
     return None
 
 async def send_message_api(token: str, chat_uuid: str, objects: list) -> Optional[int]:
@@ -314,6 +179,86 @@ async def fetch_reply_api(token: str, chat_uuid: str, after_id: int) -> Optional
                         return obj.get('object_text')
         await asyncio.sleep(POLL_INTERVAL)
     return None
+
+# ------------------------------------------------------------
+# FILE HANDLING
+# ------------------------------------------------------------
+def is_text_file(filename: str) -> bool:
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in TEXT_FILE_EXTENSIONS
+
+async def read_file_content(file_path: str) -> Optional[str]:
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        try:
+            with open(file_path, 'r', encoding='latin-1') as f:
+                return f.read()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+async def process_document(update: Update, session: dict) -> Optional[list]:
+    doc = update.message.document
+    file_size_mb = doc.file_size / (1024 * 1024) if doc.file_size else 0
+    file_name = doc.file_name or f"file_{int(time.time())}"
+
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        await update.message.reply_text(f"❌ File too large ({file_size_mb:.1f} MB). Max {MAX_FILE_SIZE_MB} MB.")
+        return None
+
+    file = await doc.get_file()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp:
+        await file.download_to_memory()
+        tmp.write(file.download_as_bytearray())
+        tmp_path = tmp.name
+
+    objects = []
+
+    if is_text_file(file_name) and file_size_mb < MAX_TEXT_FILE_SIZE_MB:
+        content = await read_file_content(tmp_path)
+        if content is not None:
+            caption = update.message.caption or ""
+            text_content = f"📄 File: {file_name}\n"
+            if caption:
+                text_content += f"Caption: {caption}\n\n"
+            text_content += f"```\n{content[:50000]}\n```"
+            objects.append({
+                "object_type": "text",
+                "object_url": None,
+                "object_text": text_content,
+                "model_type": session['model_id']
+            })
+            os.unlink(tmp_path)
+            return objects
+
+    await update.message.reply_text("📎 Uploading file...")
+    file_url = await upload_file_to_syntx(session['token'], session['chat_uuid'], tmp_path)
+    os.unlink(tmp_path)
+
+    if not file_url:
+        await update.message.reply_text("❌ File upload failed.")
+        return None
+
+    caption = update.message.caption or ""
+    if caption:
+        objects.append({
+            "object_type": "text",
+            "object_url": None,
+            "object_text": caption,
+            "model_type": session['model_id']
+        })
+
+    objects.append({
+        "object_type": "file",
+        "object_url": file_url,
+        "object_text": file_name,
+        "model_type": session['model_id']
+    })
+
+    return objects
 
 # ------------------------------------------------------------
 # ACCESS CONTROL
@@ -362,8 +307,6 @@ async def new_session(uid: int) -> Optional[str]:
 # ------------------------------------------------------------
 # BOT HANDLERS
 # ------------------------------------------------------------
-MINI_APP_URL = f"https://{NGROK_STATIC_DOMAIN}/mini-app"   # autogenerated
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_access(user.id):
@@ -375,10 +318,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(err)
         return
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Open Web Chat", web_app=WebAppInfo(url=MINI_APP_URL))]
-    ])
-
     help_text = (
         "🤖 *Claude Chat Bot Commands*\n\n"
         "/start – Start a new session\n"
@@ -386,13 +325,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/new – Reset session (fresh credentials)\n"
         "/help – Show this help\n\n"
         "📌 *Usage:*\n"
-        "Send a text message, or a photo with optional caption.\n"
-        "The bot will reply using the selected Claude model."
+        "Send a text message, photo, or document.\n"
+        "For .txt, .py and other text files, content is read directly.\n"
+        "Other files are uploaded and attached to the message."
     )
-
-    await update.message.reply_text("✅ Session started! Chat here or use the Mini App.")
+    await update.message.reply_text("✅ Session started!")
     await update.message.reply_text(help_text, parse_mode=constants.ParseMode.MARKDOWN)
-    await update.message.reply_text("✨ You can also use the Mini App:", reply_markup=keyboard)
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -425,8 +363,7 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Commands: /start, /model, /new, /help.\n"
-        "Send a text message or a photo with caption.\n"
-        "Use the Mini App for a full chat experience."
+        "Send a text message, photo, or document."
     )
 
 # Admin commands
@@ -497,6 +434,9 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     await update.message.reply_text(f"Sent to {sent} users.")
 
+# ------------------------------------------------------------
+# MESSAGE HANDLERS (text, photo, document)
+# ------------------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_access(user.id):
@@ -515,18 +455,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "object_text": text,
         "model_type": session['model_id']
     }]
-    await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.TYPING)
-    msg_id = await send_message_api(session['token'], session['chat_uuid'], objects)
-    if not msg_id:
-        await update.message.reply_text("❌ Failed to send message.")
-        return
-    reply = await fetch_reply_api(session['token'], session['chat_uuid'], msg_id)
-    if reply:
-        for i in range(0, len(reply), 4000):
-            await update.message.reply_text(reply[i:i+4000])
-        session['message_count'] += 1
-    else:
-        await update.message.reply_text("❌ No reply received.")
+    await send_and_reply(update, session, objects, user.id, context)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -547,7 +476,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = tmp.name
 
     await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.UPLOAD_PHOTO)
-    img_url = await upload_image_api(session['token'], session['chat_uuid'], tmp_path)
+    img_url = await upload_file_to_syntx(session['token'], session['chat_uuid'], tmp_path)
     os.unlink(tmp_path)
 
     if not img_url:
@@ -569,6 +498,25 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "model_type": session['model_id']
     })
 
+    await send_and_reply(update, session, objects, user.id, context)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await check_access(user.id):
+        await update.message.reply_text("⛔ Access denied.")
+        return
+    session = USER_SESSIONS.get(user.id)
+    if not session:
+        await update.message.reply_text("❌ No active session. Use /start.")
+        return
+
+    await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.TYPING)
+    objects = await process_document(update, session)
+    if objects is None:
+        return
+    await send_and_reply(update, session, objects, user.id, context)
+
+async def send_and_reply(update: Update, session: dict, objects: list, chat_id: int, context):
     msg_id = await send_message_api(session['token'], session['chat_uuid'], objects)
     if not msg_id:
         await update.message.reply_text("❌ Failed to send message.")
@@ -576,86 +524,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = await fetch_reply_api(session['token'], session['chat_uuid'], msg_id)
     if reply:
         for i in range(0, len(reply), 4000):
-            await update.message.reply_text(reply[i:i+4000])
+            await context.bot.send_message(chat_id=chat_id, text=reply[i:i+4000])
         session['message_count'] += 1
     else:
-        await update.message.reply_text("❌ No reply received.")
+        await context.bot.send_message(chat_id=chat_id, text="❌ No reply received.")
 
 # ------------------------------------------------------------
-# FASTAPI (Mini App backend)
-# ------------------------------------------------------------
-fastapi_app = FastAPI()
-
-def verify_init_data(init_data: str) -> Optional[int]:
-    try:
-        parsed = dict(pair.split('=') for pair in init_data.split('&'))
-        received_hash = parsed.pop('hash', '')
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
-        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-        if computed_hash != received_hash:
-            return None
-        user_data = json.loads(unquote(parsed.get('user', '{}')))
-        return user_data.get('id')
-    except Exception:
-        return None
-
-@fastapi_app.post("/api/init")
-async def init_endpoint(request: Request):
-    data = await request.json()
-    init_data = data.get('initData')
-    uid = verify_init_data(init_data)
-    if not uid:
-        raise HTTPException(status_code=403, detail="Invalid initData")
-    if uid not in USER_SESSIONS:
-        raise HTTPException(status_code=404, detail="No active session. Please /start in bot.")
-    return {"user_id": uid}
-
-@fastapi_app.get("/api/models")
-async def get_models():
-    return [{"id": mid, "name": mname} for mid, mname in MODELS]
-
-@fastapi_app.post("/api/set_model")
-async def set_model(request: Request):
-    data = await request.json()
-    uid = data.get('user_id')
-    model_id = data.get('model_id')
-    if uid not in USER_SESSIONS:
-        raise HTTPException(status_code=404)
-    session = USER_SESSIONS[uid]
-    session['model_id'] = model_id
-    for mid, name in MODELS:
-        if mid == model_id:
-            session['model_name'] = name
-            break
-    return {"status": "ok"}
-
-@fastapi_app.post("/api/send_message")
-async def send_message_endpoint(request: Request):
-    data = await request.json()
-    uid = data.get('user_id')
-    text = data.get('text')
-    if uid not in USER_SESSIONS:
-        raise HTTPException(status_code=404)
-    session = USER_SESSIONS[uid]
-    objects = [{
-        "object_type": "text",
-        "object_url": None,
-        "object_text": text,
-        "model_type": session['model_id']
-    }]
-    msg_id = await send_message_api(session['token'], session['chat_uuid'], objects)
-    if not msg_id:
-        return {"reply": None, "error": "Send failed"}
-    reply = await fetch_reply_api(session['token'], session['chat_uuid'], msg_id)
-    return {"reply": reply}
-
-@fastapi_app.get("/mini-app", response_class=HTMLResponse)
-async def serve_mini_app():
-    return MINI_APP_HTML
-
-# ------------------------------------------------------------
-# BACKGROUND TASK: expire users
+# BACKGROUND: expire users
 # ------------------------------------------------------------
 async def expire_loop():
     while True:
@@ -669,50 +544,30 @@ async def expire_loop():
         await asyncio.sleep(60)
 
 # ------------------------------------------------------------
-# MAIN (with automatic ngrok tunnel)
+# MAIN
 # ------------------------------------------------------------
 async def main():
-    # Configure ngrok with your authtoken
-    conf.get_default().auth_token = NGROK_AUTHTOKEN
-
-    # Start tunnel on port 8000 with your static domain
-    ngrok_tunnel = ngrok.connect(8000, "http", hostname=NGROK_STATIC_DOMAIN)
-    public_url = ngrok_tunnel.public_url
-    logger.info(f"Ngrok tunnel established at {public_url}")
-
-    # Ensure the Mini App URL is correctly set
-    global MINI_APP_URL
-    MINI_APP_URL = f"{public_url}/mini-app"
-
-    # Telegram bot setup
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    # Admin
     app.add_handler(CommandHandler("addid", addid_cmd))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     await app.initialize()
     await app.start()
     asyncio.create_task(app.updater.start_polling())
-
-    config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=8000)
-    server = uvicorn.Server(config)
-    await asyncio.gather(server.serve(), expire_loop())
+    await expire_loop()
 
 if __name__ == "__main__":
-    # Install pyngrok if not present
-    try:
-        import pyngrok
-    except ImportError:
-        import subprocess, sys
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyngrok"])
-        import pyngrok
-
     asyncio.run(main())
