@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Telegram Bot + Mini App for Syntx.ai Claude Chat
-Uses ngrok for HTTPS on the Mini App.
-Now with viral referral system: 1 referral = 30 min extra access.
+Telegram Bot + Mini App for Syntx.ai Claude Chat.
+Uses pyngrok to automatically create an HTTPS tunnel.
+All tokens are embedded (not secure – keep this file private).
 """
 
 import asyncio
@@ -25,17 +25,22 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from telegram import Update, constants, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import uvicorn
+from pyngrok import ngrok, conf
 
 # ============================================================
-# CONFIGURATION – EDIT THESE TWO VALUES
+# CONFIGURATION – PUT YOUR OWN VALUES HERE
 # ============================================================
-BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"          # Replace with your bot token from @BotFather
-ADMIN_IDS = {6535041385}                   # Replace with your Telegram numeric user ID
+BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"              # From @BotFather
+ADMIN_IDS = {6535041385}                       # Your Telegram numeric ID
 
-# After you start ngrok, you must update the Mini App URL in the /start command below.
+# ⚠️ NEVER SHARE THESE TOKENS ⚠️
+NGROK_AUTHTOKEN = "3HP88NjHElyptfGCFYWQEtwxcCK_42svz9Qv9E2Wxzs6NTECi"  # Replace with your new authtoken
+NGROK_STATIC_DOMAIN = "eats-sizzling-sturdy.ngrok-free.dev" # Your reserved free domain
+
+# After setting the domain once, you DON'T need to change anything else.
 # ============================================================
 
-# External APIs
+# External APIs (unchanged)
 EMAIL_API = "https://zecora0.serv00.net/Gmail.php"
 SYNTX_AUTH_SEND_OTP = "https://api.syntx.ai/api/v1/auth/email/send-otp"
 SYNTX_AUTH_VERIFY_OTP = "https://api.syntx.ai/api/v1/auth/email/verify-otp"
@@ -61,14 +66,6 @@ MODELS = [
 ]
 
 # ------------------------------------------------------------
-# Referral system additions (do not break core logic)
-# ------------------------------------------------------------
-REFERRAL_BONUS_SECONDS = 1800          # 30 minutes per successful referral
-NEW_USER_TRIAL_SECONDS = 1800          # new user gets 30 min trial when joining via referral
-REFERRED_BY: Dict[int, int] = {}       # user_id -> referrer_id
-REFERRAL_COUNT: Dict[int, int] = {}    # referrer_id -> number of successful invites
-
-# ------------------------------------------------------------
 ALLOWED_USERS: set[int] = set(ADMIN_IDS)
 USER_EXPIRY: Dict[int, float] = {}
 USER_SESSIONS: Dict[int, dict] = {}
@@ -78,7 +75,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
-# MINI APP HTML (unchanged)
+# MINI APP HTML (dark theme, chat UI)
 # ------------------------------------------------------------
 MINI_APP_HTML = """
 <!DOCTYPE html>
@@ -213,7 +210,7 @@ MINI_APP_HTML = """
 """
 
 # ------------------------------------------------------------
-# HELPERS (unchanged)
+# HELPERS (same as before)
 # ------------------------------------------------------------
 async def create_email():
     resp = scraper.get(f"{EMAIL_API}?action=create", timeout=HTTP_TIMEOUT)
@@ -334,9 +331,6 @@ async def check_access(user_id: int) -> bool:
         return False
     return True
 
-# ------------------------------------------------------------
-# NEW SESSION CREATION (required by /start)
-# ------------------------------------------------------------
 async def new_session(uid: int) -> Optional[str]:
     try:
         email, mid = await create_email()
@@ -366,81 +360,23 @@ async def new_session(uid: int) -> Optional[str]:
         return f"❌ Error: {e}"
 
 # ------------------------------------------------------------
-# REFERRAL HELPER (adds bonus to referrer)
-# ------------------------------------------------------------
-async def add_referral_bonus(referrer_id: int, context: ContextTypes.DEFAULT_TYPE = None):
-    """Adds 30 minutes to referrer's expiry, re-adds to ALLOWED_USERS if needed."""
-    now = time.time()
-    current_expiry = USER_EXPIRY.get(referrer_id, now)
-    if current_expiry < now:
-        current_expiry = now
-    new_expiry = current_expiry + REFERRAL_BONUS_SECONDS
-    USER_EXPIRY[referrer_id] = new_expiry
-    ALLOWED_USERS.add(referrer_id)
-    REFERRAL_COUNT[referrer_id] = REFERRAL_COUNT.get(referrer_id, 0) + 1
-    if context:
-        try:
-            until = datetime.fromtimestamp(new_expiry).strftime("%Y-%m-%d %H:%M")
-            await context.bot.send_message(
-                referrer_id,
-                f"🎉 Someone joined with your referral link!\n"
-                f"You received +30 minutes of access.\n"
-                f"Your access is now valid until {until}."
-            )
-        except Exception:
-            pass
-
-# ------------------------------------------------------------
 # BOT HANDLERS
 # ------------------------------------------------------------
+MINI_APP_URL = f"https://{NGROK_STATIC_DOMAIN}/mini-app"   # autogenerated
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_id = user.id
-
-    # --- Referral detection ---
-    referrer_id = None
-    if context.args and context.args[0].startswith('ref_'):
-        try:
-            ref_code = context.args[0][4:]
-            referrer_id = int(ref_code)
-        except ValueError:
-            referrer_id = None
-
-    # If this is a new user joining via referral, give them trial access
-    if referrer_id is not None and user_id not in ALLOWED_USERS and user_id not in USER_EXPIRY:
-        if referrer_id == user_id:
-            await update.message.reply_text("You can't refer yourself.")
-        elif user_id in REFERRED_BY:
-            await update.message.reply_text("You have already joined via a referral link.")
-        else:
-            ALLOWED_USERS.add(user_id)
-            USER_EXPIRY[user_id] = time.time() + NEW_USER_TRIAL_SECONDS
-            REFERRED_BY[user_id] = referrer_id
-            await update.message.reply_text(
-                "🎁 You received 30 minutes of free access for joining via a referral!"
-            )
-            if referrer_id in ALLOWED_USERS or referrer_id in USER_EXPIRY:
-                await add_referral_bonus(referrer_id, context)
-            else:
-                logger.info(f"Referral from unknown user {referrer_id} for {user_id}")
-
-    # ---- Original access check ----
-    if not await check_access(user_id):
-        await update.message.reply_text("⛔ Access denied. Use a referral link or contact admin.")
+    if not await check_access(user.id):
+        await update.message.reply_text("⛔ Access denied. Contact admin.")
         return
 
-    # ---- Session creation ----
-    err = await new_session(user_id)
+    err = await new_session(user.id)
     if err:
         await update.message.reply_text(err)
         return
 
-    # ---------- CHANGE THIS URL AFTER YOU START NGROK ----------
-    mini_app_url = "https://YOUR_NGROK_URL.ngrok-free.app/mini-app"
-    # -----------------------------------------------------------
-
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Open Web Chat", web_app=WebAppInfo(url=mini_app_url))]
+        [InlineKeyboardButton("💬 Open Web Chat", web_app=WebAppInfo(url=MINI_APP_URL))]
     ])
 
     help_text = (
@@ -448,7 +384,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start – Start a new session\n"
         "/model number – Choose Claude model\n"
         "/new – Reset session (fresh credentials)\n"
-        "/myref – Show your referral link & stats\n"
         "/help – Show this help\n\n"
         "📌 *Usage:*\n"
         "Send a text message, or a photo with optional caption.\n"
@@ -459,38 +394,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode=constants.ParseMode.MARKDOWN)
     await update.message.reply_text("✨ You can also use the Mini App:", reply_markup=keyboard)
 
-# ------------------------------------------------------------
-# New command: /myref – shows referral link and stats
-# ------------------------------------------------------------
-async def myref_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not await check_access(user.id):
-        await update.message.reply_text("⛔ You don't have access to the bot yet.")
-        return
-
-    bot_username = (await context.bot.get_me()).username
-    referral_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
-    count = REFERRAL_COUNT.get(user.id, 0)
-
-    expiry = USER_EXPIRY.get(user.id)
-    if expiry:
-        remaining = max(0, expiry - time.time())
-        remaining_str = f"{int(remaining // 3600)}h {int((remaining % 3600) // 60)}m"
-    else:
-        remaining_str = "unlimited (admin)"
-
-    msg = (
-        f"🔗 *Your referral link:*\n`{referral_link}`\n\n"
-        f"👥 People invited: {count}\n"
-        f"⏳ Access remaining: {remaining_str}\n\n"
-        f"Share this link – each user who joins gives you +30 minutes!"
-    )
-    await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN,
-                                    disable_web_page_preview=True)
-
-# ------------------------------------------------------------
-# Other commands (unchanged)
-# ------------------------------------------------------------
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_access(user.id) or user.id not in USER_SESSIONS:
@@ -521,12 +424,12 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Commands: /start, /model, /new, /myref, /help.\n"
+        "Commands: /start, /model, /new, /help.\n"
         "Send a text message or a photo with caption.\n"
         "Use the Mini App for a full chat experience."
     )
 
-# Admin commands (unchanged)
+# Admin commands
 async def addid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
@@ -576,10 +479,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active = len(USER_SESSIONS)
     now = time.time()
     premium = sum(1 for u in ALLOWED_USERS if u not in ADMIN_IDS and USER_EXPIRY.get(u, 0) > now)
-    total_referrals = sum(REFERRAL_COUNT.values())
-    await update.message.reply_text(
-        f"Active sessions: {active}\nPremium users: {premium}\nTotal referrals: {total_referrals}"
-    )
+    await update.message.reply_text(f"Active sessions: {active}\nPremium users: {premium}")
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -682,7 +582,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No reply received.")
 
 # ------------------------------------------------------------
-# FASTAPI (unchanged)
+# FASTAPI (Mini App backend)
 # ------------------------------------------------------------
 fastapi_app = FastAPI()
 
@@ -755,7 +655,7 @@ async def serve_mini_app():
     return MINI_APP_HTML
 
 # ------------------------------------------------------------
-# BACKGROUND TASK: expire users (unchanged)
+# BACKGROUND TASK: expire users
 # ------------------------------------------------------------
 async def expire_loop():
     while True:
@@ -769,23 +669,32 @@ async def expire_loop():
         await asyncio.sleep(60)
 
 # ------------------------------------------------------------
-# MAIN (register /myref command)
+# MAIN (with automatic ngrok tunnel)
 # ------------------------------------------------------------
 async def main():
+    # Configure ngrok with your authtoken
+    conf.get_default().auth_token = NGROK_AUTHTOKEN
+
+    # Start tunnel on port 8000 with your static domain
+    ngrok_tunnel = ngrok.connect(8000, "http", hostname=NGROK_STATIC_DOMAIN)
+    public_url = ngrok_tunnel.public_url
+    logger.info(f"Ngrok tunnel established at {public_url}")
+
+    # Ensure the Mini App URL is correctly set
+    global MINI_APP_URL
+    MINI_APP_URL = f"{public_url}/mini-app"
+
+    # Telegram bot setup
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("myref", myref_cmd))   # <-- new referral command
-    # Admin
     app.add_handler(CommandHandler("addid", addid_cmd))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
@@ -798,4 +707,12 @@ async def main():
     await asyncio.gather(server.serve(), expire_loop())
 
 if __name__ == "__main__":
+    # Install pyngrok if not present
+    try:
+        import pyngrok
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyngrok"])
+        import pyngrok
+
     asyncio.run(main())
