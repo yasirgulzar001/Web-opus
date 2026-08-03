@@ -33,7 +33,7 @@ from starlette.routing import Route
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-BOT_TOKEN = "8284048798:AAHd4XbDoJ2VXhN2hL3b9s_8GVEyD7yREdg"
+BOT_TOKEN = "8284048798:"
 ADMIN_IDS = {6535041385}
 BOT_USERNAME = "PROBIxAichatbot"   # <-- Replace with your actual bot username
 
