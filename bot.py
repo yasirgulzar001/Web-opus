@@ -82,14 +82,18 @@ UNAUTHORIZED_MSG = (
 )
 
 # ------------------------------------------------------------
-# Helpers
+# FIXED: is_allowed() now correctly rejects unknown users
 # ------------------------------------------------------------
 def is_allowed(user_id: int) -> bool:
-    expiry = ALLOWED_USERS.get(user_id)
+    """Return True if user is explicitly allowed and not expired."""
+    if user_id not in ALLOWED_USERS:
+        return False                # completely unknown → not allowed
+    expiry = ALLOWED_USERS[user_id]
     if expiry is None:
-        return True
+        return True                 # permanent access
     if expiry > datetime.now():
-        return True
+        return True                 # still valid
+    # expired – remove from dict and clean up session
     ALLOWED_USERS.pop(user_id, None)
     USER_SESSIONS.pop(user_id, None)
     return False
@@ -248,7 +252,7 @@ async def fetch_reply(token: str, chat_uuid: str, after_id: int, timeout: int = 
     return None
 
 # ------------------------------------------------------------
-# Session management
+# Session management (unchanged)
 # ------------------------------------------------------------
 async def new_session(chat_id: int) -> Optional[str]:
     try:
@@ -285,7 +289,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start with optional referral code."""
     user = update.effective_user
     try:
-        # If already allowed, just start session
+        # If already allowed, start session immediately
         if is_allowed(user.id):
             err = await new_session(user.id)
             if err:
@@ -334,11 +338,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if not referral_processed:
-            # Show the premium prompt
+            # Show the premium prompt immediately – no waiting
             await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
             return
 
-        # Referral successful – start session
+        # Referral successful – start session for the new user
         err = await new_session(user.id)
         if err:
             await update.message.reply_text(err)
@@ -349,7 +353,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"start handler exception: {e}", exc_info=True)
-        # Fallback message so the user never sees nothing
+        # Fallback so the user always sees something
         await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
 
 async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
