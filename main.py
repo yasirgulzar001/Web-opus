@@ -32,7 +32,7 @@ from telegram.ext import (
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-BOT_TOKEN = "8799719369:AAGvETel8yd-DijB6hqNPyUWMc"
+BOT_TOKEN = "8778402235:AAE_bQx95vdU2wkUQsCr8qxc1FCp-ICnhiY"
 ADMIN_IDS = {6535041385}
 BOT_USERNAME = "PROBIxAichatbot"
 
@@ -725,14 +725,14 @@ async def newmem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
 
-        new_session = USER_SESSIONS[user.id]
+        new_ses = USER_SESSIONS[user.id]
 
         # Step 4: Send memory to new session
         success = await send_memory_to_new_session(
-            new_session["token"],
-            new_session["chat_uuid"],
+            new_ses["token"],
+            new_ses["chat_uuid"],
             memory_content,
-            new_session["model_id"]
+            new_ses["model_id"]
         )
 
         if not success:
@@ -744,11 +744,11 @@ async def newmem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Step 5: Transfer history and settings to new session
-        new_session["history"] = old_session.get("history", [])
-        new_session["model_id"] = old_session.get("model_id", "claude-sonnet-5")
-        new_session["model_name"] = old_session.get("model_name", "Claude Sonnet 5")
-        new_session["message_count"] = old_session.get("message_count", 0)
-        new_session["start_time"] = old_session.get("start_time", datetime.now().isoformat())
+        new_ses["history"] = old_session.get("history", [])
+        new_ses["model_id"] = old_session.get("model_id", "claude-sonnet-5")
+        new_ses["model_name"] = old_session.get("model_name", "Claude Sonnet 5")
+        new_ses["message_count"] = old_session.get("message_count", 0)
+        new_ses["start_time"] = old_session.get("start_time", datetime.now().isoformat())
 
         memory_transferred = True
 
