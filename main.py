@@ -32,7 +32,7 @@ from telegram.ext import (
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-BOT_TOKEN = "8799719369:AAGvETu47W87nRB6hqNPyUWMc"
+BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"
 ADMIN_IDS = {6535041385}
 BOT_USERNAME = "PROBIxAichatbot"
 
@@ -186,12 +186,14 @@ def build_memory_markdown(session: Dict[str, Any]) -> str:
     md += "## Session Information\n"
     md += f"- Model: {session.get('model_name', 'Unknown')}\n"
     md += f"- Session start time: {session.get('start_time', 'Unknown')}\n"
-    md += f"- Total messages: {len(session.get('history', []))}\n\n"
+    history = session.get("history", [])
+    md += f"- Total messages: {len(history)}\n\n"
     md += "## Conversation History\n\n"
 
-    for msg in session.get("history", []):
-        role = "User" if msg["role"] == "user" else "Assistant"
-        md += f"### {role}\n{msg['content']}\n\n"
+    for msg in history:
+        role = msg.get("role", "unknown").capitalize()
+        content = msg.get("content", "")
+        md += f"### {role}\n{content}\n\n"
 
     return md
 
@@ -211,7 +213,8 @@ async def send_memory_to_new_session(token: str, chat_uuid: str, memory_content:
             "object_text": f"Here is the previous conversation memory for context:\n\n{memory_content}",
             "model_type": model_id
         }]
-        msg_id = await send_message(token, chat_uuid, objects)
+        # Use a 60s timeout for large memory uploads
+        msg_id = await send_message(token, chat_uuid, objects, timeout=60)
         return msg_id is not None
     except Exception as e:
         logger.error(f"Failed to send memory to new session: {e}")
@@ -451,7 +454,7 @@ async def upload_image(token: str, chat_uuid: str, file_path: str) -> Optional[s
         logger.error(f"Image upload failed: {e}")
         return None
 
-async def send_message(token: str, chat_uuid: str, objects: list) -> Optional[int]:
+async def send_message(token: str, chat_uuid: str, objects: list, timeout: int = HTTP_TIMEOUT) -> Optional[int]:
     def _sync():
         resp = scraper.post(
             f"{SYNTX_CHATS}/{chat_uuid}/messages?ai_name=claude",
@@ -460,7 +463,7 @@ async def send_message(token: str, chat_uuid: str, objects: list) -> Optional[in
                 "Authorization": f"Bearer {token}",
                 "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
             },
-            timeout=HTTP_TIMEOUT,
+            timeout=timeout,
         )
         if resp.status_code == 200:
             return resp.json().get("id")
@@ -690,6 +693,7 @@ async def newmem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("🧠 Generating memory and creating new session...")
     tmp_dir = None
+    memory_transferred = False
 
     try:
         # Step 1: Generate memory.md content
@@ -715,14 +719,15 @@ async def newmem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_session_err = await new_session(user.id)
 
         if new_session_err:
-            # new_session doesn't destroy old session if it fails, so it's still intact
-            await status_msg.edit_text(f"❌ Failed to create new session: {new_session_err}\nOld session restored.")
+            try:
+                await status_msg.edit_text(f"❌ Failed to create new session: {new_session_err}\nOld session restored.")
+            except Exception:
+                pass
             return
 
         new_session = USER_SESSIONS[user.id]
 
         # Step 4: Send memory to new session
-        # We send the memory_content as text because file upload is restricted to images in this API
         success = await send_memory_to_new_session(
             new_session["token"],
             new_session["chat_uuid"],
@@ -731,9 +736,11 @@ async def newmem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if not success:
-            # Restore old session if memory import failed
             USER_SESSIONS[user.id] = old_session
-            await status_msg.edit_text("❌ Failed to import memory to new session. Old session restored.")
+            try:
+                await status_msg.edit_text("❌ Failed to import memory to new session. Old session restored.")
+            except Exception:
+                pass
             return
 
         # Step 5: Transfer history and settings to new session
@@ -743,8 +750,14 @@ async def newmem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_session["message_count"] = old_session.get("message_count", 0)
         new_session["start_time"] = old_session.get("start_time", datetime.now().isoformat())
 
+        memory_transferred = True
+
         # Step 6: Reply
-        await status_msg.delete()
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+            
         await update.message.reply_text(
             "✅ Memory transferred successfully.\n"
             "New Claude session created.\n"
@@ -753,12 +766,18 @@ async def newmem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"newmem handler error: {e}", exc_info=True)
-        if old_session:
-            USER_SESSIONS[user.id] = old_session  # Ensure old session is restored
-        try:
-            await status_msg.edit_text("❌ An error occurred during memory transfer. Old session restored.")
-        except:
-            await update.message.reply_text("❌ An error occurred during memory transfer. Old session restored.")
+        if not memory_transferred:
+            if old_session:
+                USER_SESSIONS[user.id] = old_session
+            try:
+                await status_msg.edit_text(f"❌ An error occurred during memory transfer: {str(e)[:100]}\nOld session restored.")
+            except:
+                await update.message.reply_text(f"❌ An error occurred during memory transfer: {str(e)[:100]}\nOld session restored.")
+        else:
+            try:
+                await update.message.reply_text("✅ Memory transferred successfully, but a minor error occurred during final notification.")
+            except:
+                pass
     finally:
         if tmp_dir and os.path.exists(tmp_dir):
             try:
@@ -902,7 +921,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Append to history
     append_history(session, "user", text)
 
     objects = [
@@ -986,7 +1004,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         prompt_text_parts.append(f"[Image: {os.path.basename(tmp_path)}]")
 
-        # Append to history
         append_history(session, "user", " ".join(prompt_text_parts))
 
         msg_id = await send_message(session["token"], session["chat_uuid"], objects)
@@ -1039,12 +1056,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not doc:
         return
 
-    # 5MB limit for text files to prevent memory issues
     if doc.file_size and doc.file_size > 5 * 1024 * 1024:
         await update.message.reply_text("❌ File is too large (max 5MB for text files).")
         return
 
-    # Check extension
     file_name = doc.file_name or ""
     ext = os.path.splitext(file_name)[1].lower()
     mime_type = doc.mime_type or ""
@@ -1060,13 +1075,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_path = tmp.name
         await file_obj.download_to_drive(tmp_path)
 
-        # Reject binary files
         is_bin = await asyncio.to_thread(is_binary, tmp_path)
         if is_bin:
             await update.message.reply_text("❌ Binary files are not supported.")
             return
 
-        # Attempt to read as text
         try:
             def _read():
                 with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -1092,7 +1105,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"```{ext_hint}\n{content}\n```"
         )
 
-        # Append to history
         append_history(session, "user", prompt_text)
 
         objects = [{
