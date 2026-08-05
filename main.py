@@ -39,8 +39,8 @@ from telegram.ext import (
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"  # Hardcoded as requested
-ADMIN_IDS = {6535041385}                     # Admin Telegram user ID(s)
+BOT_TOKEN = "8744700050:AAEUgQz02NsDFLY-yGsTythE9IWbwptly_U"  # Hardcoded as requested
+ADMIN_IDS = {6535041385}                     #  Telegram user ID(s)
 BOT_USERNAME = "PROBIxAichatbot"              # ⚠️ Replace with your actual bot username (without @)
 
 REFERRER_REWARD_MINUTES = 30      # what the referrer earns per referral
