@@ -13,8 +13,10 @@ import sys
 import time
 import tempfile
 import sqlite3
+import random
+import string
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import cloudscraper
 import requests
@@ -100,6 +102,7 @@ logger = logging.getLogger(__name__)
 ALLOWED_USERS: Dict[int, Optional[datetime]] = {uid: None for uid in ADMIN_IDS}
 USER_SESSIONS: Dict[int, Dict[str, Any]] = {}
 REFERRAL_COUNT: Dict[int, int] = {}
+ALLAC_USERS: set = set()  # track users granted unlimited by /allac
 
 # Initialize scraper globally
 scraper = cloudscraper.create_scraper()
@@ -111,18 +114,27 @@ UNAUTHORIZED_MSG = (
 )
 
 # ------------------------------------------------------------
-# Database Functions (SQLite for permanent referral tracking)
+# Database Functions (SQLite for permanent referral tracking & redeem codes)
 # ------------------------------------------------------------
 def init_db():
-    """Initialize the SQLite database."""
+    """Initialize the SQLite database with tables for referrals and redeem codes."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+        # Referral claims table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS referral_claims (
                 user_id INTEGER PRIMARY KEY,
                 referrer_id INTEGER,
                 claim_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Redeem codes table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS redeem_codes (
+                code TEXT PRIMARY KEY,
+                days INTEGER NOT NULL,
+                is_used INTEGER DEFAULT 0
             )
         """)
         conn.commit()
@@ -151,6 +163,50 @@ def claim_referral(user_id: int, referrer_id: int) -> bool:
     except sqlite3.Error as e:
         logger.error(f"Database error in claim_referral for user {user_id}: {e}")
         return False
+
+def generate_redeem_codes(amount: int, days: int) -> list:
+    """Generate and store `amount` unique redeem codes each giving `days` premium days."""
+    codes = []
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+    for _ in range(amount):
+        # Generate a unique 10-char alphanumeric code
+        while True:
+            code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+            cursor.execute("SELECT code FROM redeem_codes WHERE code=?", (code,))
+            if not cursor.fetchone():
+                break
+        cursor.execute("INSERT INTO redeem_codes (code, days) VALUES (?, ?)", (code, days))
+        codes.append(code)
+    conn.commit()
+    conn.close()
+    return codes
+
+def redeem_code(code: str) -> Optional[int]:
+    """
+    Redeem a code: mark it as used and return the number of days.
+    Returns None if the code is invalid or already used.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute("SELECT days, is_used FROM redeem_codes WHERE code=?", (code,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None
+        days, is_used = row
+        if is_used:
+            conn.close()
+            return None
+        # Mark as used
+        cursor.execute("UPDATE redeem_codes SET is_used=1 WHERE code=?", (code,))
+        conn.commit()
+        conn.close()
+        return days
+    except sqlite3.Error as e:
+        logger.error(f"Database error in redeem_code: {e}")
+        return None
 
 # ------------------------------------------------------------
 # Helper: add or extend premium for a user
@@ -634,6 +690,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/model [number] – Choose Claude model\n"
         "/new – Reset session (fresh credentials)\n"
         "/referral – Get your referral link &amp; stats\n"
+        "/redeem <code> – Redeem a premium code\n"
         "/help – Show this help\n\n"
         "<b>OWNER: @NEVER_DIE8</b> – contact for premium"
     )
@@ -678,6 +735,57 @@ async def add_user_timed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ User {uid} added for {hours} hour(s). Expires at {expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC."
     )
 
+async def add_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /addid <user_id> <hours> – same as /userid but dedicated."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /addid <user_id> <hours>")
+        return
+    try:
+        uid = int(context.args[0])
+        hours = float(context.args[1])
+        if hours <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID or hours.")
+        return
+
+    expiry = datetime.now() + timedelta(hours=hours)
+    ALLOWED_USERS[uid] = expiry
+    await update.message.reply_text(
+        f"✅ User {uid} added for {hours} hour(s). Expires at {expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC."
+    )
+
+async def gen_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /gen <amount> <days> – generates redeem codes."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /gen <amount_of_codes> <expiry_in_days>")
+        return
+    try:
+        amount = int(context.args[0])
+        days = int(context.args[1])
+        if amount <= 0 or amount > 50:
+            await update.message.reply_text("❌ Amount must be between 1 and 50.")
+            return
+        if days <= 0 or days > 365:
+            await update.message.reply_text("❌ Days must be between 1 and 365.")
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Invalid numbers.")
+        return
+
+    codes = await asyncio.to_thread(generate_redeem_codes, amount, days)
+    codes_text = "\n".join(f"<code>{c}</code>" for c in codes)
+    await update.message.reply_text(
+        f"✅ Generated {amount} code(s) for {days} day(s) each:\n{codes_text}",
+        parse_mode=constants.ParseMode.HTML
+    )
+
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
@@ -692,6 +800,7 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         ALLOWED_USERS.pop(uid, None)
         USER_SESSIONS.pop(uid, None)
+        ALLAC_USERS.discard(uid)
         await update.message.reply_text(f"✅ User {uid} removed.")
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.")
@@ -743,6 +852,151 @@ async def admin_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ No active session.")
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.")
+
+# ------------------------------------------------------------
+# New admin commands: /allac and /off
+# ------------------------------------------------------------
+async def allac_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Activate unlimited premium for all currently known users."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    global ALLAC_USERS
+    count = 0
+    for uid in list(ALLOWED_USERS.keys()):
+        ALLOWED_USERS[uid] = None  # set to unlimited
+        ALLAC_USERS.add(uid)
+        count += 1
+    await update.message.reply_text(f"✅ All {count} users have been granted unlimited premium.")
+
+async def off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Revoke unlimited premium from users who received it via /allac."""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    global ALLAC_USERS
+    removed = 0
+    for uid in list(ALLAC_USERS):
+        ALLOWED_USERS.pop(uid, None)
+        USER_SESSIONS.pop(uid, None)
+        removed += 1
+    ALLAC_USERS.clear()
+    await update.message.reply_text(f"✅ Unlimited premium revoked for {removed} users. They no longer have access.")
+
+# ------------------------------------------------------------
+# New admin command: /list
+# ------------------------------------------------------------
+def build_user_list(max_users: Optional[int] = None) -> str:
+    """Build a formatted text list of all users and their premium status."""
+    lines = ["User ID | Premium Status | Expiry | Referrals"]
+    now = datetime.now()
+    
+    # Sort users by ID or premium status; let's just sort by user ID
+    sorted_users = sorted(ALLOWED_USERS.items(), key=lambda x: x[0])
+    
+    # Limit if max_users is specified
+    if max_users is not None:
+        sorted_users = sorted_users[:max_users]
+    
+    for uid, expiry in sorted_users:
+        referrals = REFERRAL_COUNT.get(uid, 0)
+        if expiry is None:
+            status = "Unlimited"
+            expiry_str = "Permanent"
+        elif expiry > now:
+            status = "Active"
+            expiry_str = expiry.strftime("%Y-%m-%d %H:%M")
+        else:
+            status = "Expired"
+            expiry_str = expiry.strftime("%Y-%m-%d %H:%M")  # still show expired time
+        lines.append(f"{uid} | {status} | {expiry_str} | {referrals}")
+    
+    return "\n".join(lines)
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /list <all/amount> <chat/.txt>"""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /list <all|amount> <chat|.txt>")
+        return
+    
+    first_arg = context.args[0].lower()
+    second_arg = context.args[1].lower()
+    
+    # Determine max_users
+    max_users = None
+    if first_arg == "all":
+        max_users = None
+    else:
+        try:
+            max_users = int(first_arg)
+            if max_users <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ First argument must be 'all' or a positive number.")
+            return
+    
+    # Determine output format
+    if second_arg not in ("chat", ".txt"):
+        await update.message.reply_text("❌ Second argument must be 'chat' or '.txt'.")
+        return
+    
+    user_list_text = build_user_list(max_users)
+    
+    if second_arg == "chat":
+        await send_long_message(update, user_list_text)
+    else:  # .txt
+        # Write to a temp file and send as document
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8") as tmp:
+                tmp.write(user_list_text)
+                tmp_path = tmp.name
+            
+            await update.message.reply_document(
+                document=open(tmp_path, "rb"),
+                filename="user_list.txt",
+                caption=f"📋 User list ({len(ALLOWED_USERS)} total users)"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send user list file: {e}")
+            await update.message.reply_text("❌ Failed to create list file.")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+# ------------------------------------------------------------
+# User redeem command
+# ------------------------------------------------------------
+async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User command: /redeem <code> – claim a premium code."""
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text("Usage: /redeem <code>")
+        return
+
+    code = context.args[0].strip().upper()
+    days = await asyncio.to_thread(redeem_code, code)
+    if days is None:
+        await update.message.reply_text("❌ Invalid or already used code.")
+        return
+
+    # Convert days to minutes and add premium
+    minutes = days * 24 * 60
+    add_or_extend_premium(user.id, minutes)
+
+    expiry = ALLOWED_USERS.get(user.id)
+    exp_str = expiry.strftime('%Y-%m-%d %H:%M UTC') if expiry and isinstance(expiry, datetime) else "Permanent"
+    await update.message.reply_text(
+        f"✅ Code redeemed! You received {days} day(s) of premium.\n"
+        f"Your premium now expires: {exp_str}"
+    )
 
 # ------------------------------------------------------------
 # Message handlers
@@ -1000,9 +1254,15 @@ def main():
     app.add_handler(CommandHandler("model", model_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("redeem", redeem_cmd))
 
     app.add_handler(CommandHandler("adduser", add_user))
     app.add_handler(CommandHandler("userid", add_user_timed))
+    app.add_handler(CommandHandler("addid", add_id_cmd))
+    app.add_handler(CommandHandler("gen", gen_codes))
+    app.add_handler(CommandHandler("allac", allac_cmd))
+    app.add_handler(CommandHandler("off", off_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))  # New /list command
     app.add_handler(CommandHandler("removeuser", remove_user))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("stats", stats))
@@ -1010,7 +1270,6 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    # Use filters.Document.ALL but handle text reading safely inside the function
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     app.add_error_handler(error_handler)
