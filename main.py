@@ -39,7 +39,7 @@ from telegram.ext import (
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-BOT_TOKEN = "8744700050:AAEUgQz0IWbwptly_U"  # Hardcoded as requested
+BOT_TOKEN = "8799719369:AAG4sQ4wOw54EljMoePgnbRpFGS6Y_XKAps"  # Hardcoded as requested
 ADMIN_IDS = {6535041385}                     #  Telegram user ID(s)
 BOT_USERNAME = "PROBIxAichatbot"              # ⚠️ Replace with your actual bot username (without @)
 
