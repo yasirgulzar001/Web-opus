@@ -20,7 +20,7 @@ from typing import Optional, Dict, Any, List
 
 import cloudscraper
 import requests
-from telegram import Update, constants
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -32,7 +32,7 @@ from telegram.ext import (
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-BOT_TOKEN = "8799719369:AAGvETel87nRB6hqNPyUWMc"  # Hardcoded as requested
+BOT_TOKEN = "8799719369:AAGvETel8yd-Dijvu47W87nRB6hqNPyUWMc"  # Hardcoded as requested
 ADMIN_IDS = {6535041385}                     # Admin Telegram user ID(s)
 BOT_USERNAME = "PROBIxAichatbot"              # ⚠️ Replace with your actual bot username (without @)
 
@@ -275,7 +275,7 @@ async def send_response_with_code_files(update: Update, text: str, model_name: s
     final_text = f"**{model_name}:** {cleaned_text}".strip()
     
     # Send the text part
-    await send_long_message(update, final_text, parse_mode=constants.ParseMode.MARKDOWN)
+    await send_long_message(update, final_text, parse_mode='Markdown')
     
     # Send the code files
     for i, (ext, code) in enumerate(code_blocks, 1):
@@ -297,7 +297,7 @@ async def send_response_with_code_files(update: Update, text: str, model_name: s
         except Exception as e:
             logger.error(f"Failed to send code file: {e}")
             # Fallback: send code as text if file sending fails
-            await send_long_message(update, f"```\n{code}\n```", parse_mode=constants.ParseMode.MARKDOWN)
+            await send_long_message(update, f"```\n{code}\n```", parse_mode='Markdown')
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -592,7 +592,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Check if user is allowed to use the bot
         if not is_allowed(user.id):
-            await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
+            await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode='HTML')
             return
 
         err = await new_session(user.id)
@@ -612,7 +612,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as e:
         logger.error(f"start handler exception: {e}", exc_info=True)
-        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode='HTML')
 
 async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Give referral link to ANYONE."""
@@ -640,12 +640,12 @@ async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎁 New users get <b>{REFERREE_TRIAL_MINUTES} min</b> trial.\n"
         f"🔁 No limit – refer as many as you want!"
     )
-    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
+    await update.message.reply_text(msg, parse_mode='HTML', disable_web_page_preview=True)
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_allowed(user.id) or user.id not in USER_SESSIONS:
-        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode='HTML')
         return
 
     if not context.args:
@@ -671,7 +671,7 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_allowed(user.id):
-        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode='HTML')
         return
         
     USER_SESSIONS.pop(user.id, None)
@@ -694,7 +694,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help – Show this help\n\n"
         "<b>OWNER: @NEVER_DIE8</b> – contact for premium"
     )
-    await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
+    await update.message.reply_text(text, parse_mode='HTML')
 
 # ------------------------------------------------------------
 # Admin commands
@@ -783,7 +783,7 @@ async def gen_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     codes_text = "\n".join(f"<code>{c}</code>" for c in codes)
     await update.message.reply_text(
         f"✅ Generated {amount} code(s) for {days} day(s) each:\n{codes_text}",
-        parse_mode=constants.ParseMode.HTML
+        parse_mode='HTML'
     )
 
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -891,10 +891,8 @@ def build_user_list(max_users: Optional[int] = None) -> str:
     lines = ["User ID | Premium Status | Expiry | Referrals"]
     now = datetime.now()
     
-    # Sort users by ID or premium status; let's just sort by user ID
     sorted_users = sorted(ALLOWED_USERS.items(), key=lambda x: x[0])
     
-    # Limit if max_users is specified
     if max_users is not None:
         sorted_users = sorted_users[:max_users]
     
@@ -908,7 +906,7 @@ def build_user_list(max_users: Optional[int] = None) -> str:
             expiry_str = expiry.strftime("%Y-%m-%d %H:%M")
         else:
             status = "Expired"
-            expiry_str = expiry.strftime("%Y-%m-%d %H:%M")  # still show expired time
+            expiry_str = expiry.strftime("%Y-%m-%d %H:%M")
         lines.append(f"{uid} | {status} | {expiry_str} | {referrals}")
     
     return "\n".join(lines)
@@ -926,7 +924,6 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_arg = context.args[0].lower()
     second_arg = context.args[1].lower()
     
-    # Determine max_users
     max_users = None
     if first_arg == "all":
         max_users = None
@@ -939,7 +936,6 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ First argument must be 'all' or a positive number.")
             return
     
-    # Determine output format
     if second_arg not in ("chat", ".txt"):
         await update.message.reply_text("❌ Second argument must be 'chat' or '.txt'.")
         return
@@ -949,7 +945,6 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if second_arg == "chat":
         await send_long_message(update, user_list_text)
     else:  # .txt
-        # Write to a temp file and send as document
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8") as tmp:
@@ -987,7 +982,6 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid or already used code.")
         return
 
-    # Convert days to minutes and add premium
     minutes = days * 24 * 60
     add_or_extend_premium(user.id, minutes)
 
@@ -1004,7 +998,7 @@ async def redeem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_allowed(user.id):
-        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode='HTML')
         return
 
     session = USER_SESSIONS.get(user.id)
@@ -1025,13 +1019,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
     ]
 
-    await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.TYPING)
+    await context.bot.send_chat_action(chat_id=user.id, action='typing')
     msg_id = await send_message(session["token"], session["chat_uuid"], objects)
     if not msg_id:
         await update.message.reply_text("❌ Failed to send message.")
         return
 
-    # Start thinking animation
     status_msg = await update.message.reply_text("🧠 Thinking...")
     anim_task = asyncio.create_task(animate_thinking(context.bot, user.id, status_msg.message_id))
 
@@ -1057,7 +1050,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_allowed(user.id):
-        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode='HTML')
         return
 
     session = USER_SESSIONS.get(user.id)
@@ -1072,7 +1065,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_path = tmp.name
         await photo_file.download_to_drive(tmp_path)
 
-        await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.UPLOAD_PHOTO)
+        await context.bot.send_chat_action(chat_id=user.id, action='upload_photo')
         img_url = await upload_image(session["token"], session["chat_uuid"], tmp_path)
         if not img_url:
             await update.message.reply_text("❌ Image upload failed.")
@@ -1099,7 +1092,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Failed to send message.")
             return
 
-        # Start thinking animation
         status_msg = await update.message.reply_text("🧠 Thinking...")
         anim_task = asyncio.create_task(animate_thinking(context.bot, user.id, status_msg.message_id))
 
@@ -1132,7 +1124,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles .txt, .py, .js etc. Reads content and sends to Claude."""
     user = update.effective_user
     if not is_allowed(user.id):
-        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text(UNAUTHORIZED_MSG, parse_mode='HTML')
         return
 
     session = USER_SESSIONS.get(user.id)
@@ -1144,7 +1136,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not doc:
         return
 
-    # 5MB limit for text files to prevent memory issues
     if doc.file_size and doc.file_size > 5 * 1024 * 1024:
         await update.message.reply_text("❌ File is too large (max 5MB for text files).")
         return
@@ -1156,11 +1147,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_path = tmp.name
         await file_obj.download_to_drive(tmp_path)
 
-        # Attempt to read as text
         try:
             with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
-        except Exception as e:
+        except Exception:
             await update.message.reply_text("❌ Failed to read file content. Is it a text file?")
             return
 
@@ -1169,7 +1159,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         caption = update.message.caption or ""
-        # Determine extension to hint Claude
         ext = os.path.splitext(doc.file_name)[1].lstrip(".") if doc.file_name else "txt"
         
         prompt_text = (
@@ -1188,13 +1177,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "model_type": session["model_id"],
         }]
 
-        await context.bot.send_chat_action(chat_id=user.id, action=constants.ChatAction.TYPING)
+        await context.bot.send_chat_action(chat_id=user.id, action='typing')
         msg_id = await send_message(session["token"], session["chat_uuid"], objects)
         if not msg_id:
             await update.message.reply_text("❌ Failed to send message.")
             return
 
-        # Start thinking animation
         status_msg = await update.message.reply_text("🧠 Thinking...")
         anim_task = asyncio.create_task(animate_thinking(context.bot, user.id, status_msg.message_id))
 
@@ -1244,9 +1232,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ------------------------------------------------------------
 def main():
-    init_db()  # Initialize SQLite database on startup
+    init_db()
     
-    # concurrent_updates=True allows the bot to handle multiple users in parallel
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -1262,7 +1249,7 @@ def main():
     app.add_handler(CommandHandler("gen", gen_codes))
     app.add_handler(CommandHandler("allac", allac_cmd))
     app.add_handler(CommandHandler("off", off_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))  # New /list command
+    app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("removeuser", remove_user))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("stats", stats))
